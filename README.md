@@ -1,0 +1,170 @@
+# seedcrypt-recover
+
+> Fast offline BIP39 seed recovery tool — a Rust port of the relevant parts of [btcrecover](https://github.com/3rdIteration/btcrecover).
+
+100% offline. No network calls anywhere in this tool or its dependencies.
+Your seed never leaves your machine.
+
+## What it does
+
+Given a partially known BIP39 seed phrase and a wallet address you control, this tool brute-forces the missing or mistyped words by validating each candidate against the address.
+
+Two modes:
+
+- `missing` — you know most words but **N** positions are blank (use `?`)
+- `typo` — you have all 12/24 words but suspect **one is wrong**
+
+Both modes use [`libsecp256k1`](https://github.com/bitcoin-core/secp256k1) (FFI'd via the [`secp256k1`](https://crates.io/crates/secp256k1) crate) for the elliptic-curve math, with [`rayon`](https://crates.io/crates/rayon) for parallel iteration across CPU cores. First match wins, others stop.
+
+## Why
+
+[btcrecover](https://github.com/3rdIteration/btcrecover) is the reference tool but ships as Python with a heavy dependency tree, no pre-built binary, and a setup-heavy install. This is:
+
+- A single binary (~3 MB, statically linked).
+- Memory-safe (Rust's borrow checker eliminates whole classes of crypto-relevant CVEs).
+- Same speed as btcrecover in practice (the hot path is `libsecp256k1` either way).
+- Reusable as a library (`cdylib`) — the same crate can be FFI'd from Flutter / Python / Node.js / Go.
+
+## Status
+
+- ✅ BIP39 mnemonic checksum + 12/15/18/21/24-word seeds
+- ✅ HD derivation (BIP32) for BIP44, BIP49, BIP84, BIP86
+- ✅ Missing-word recovery (1–3 words at known positions)
+- ✅ Typo correction (1 word wrong, position unknown)
+- ✅ Address-based validation (early exit on match)
+- ✅ Multi-core parallel search via rayon
+- ⏳ Wrong-order recovery (permutations) — not yet
+- ⏳ Multi-language wordlists — English only
+
+## Supported coins
+
+All secp256k1-based chains. Auto-detected from address prefix.
+
+| Coin | Derivation types | Address prefix |
+|------|------------------|----------------|
+| **Bitcoin** | BIP44 / BIP49 / BIP84 / BIP86 | `1…` `3…` `bc1q…` `bc1p…` |
+| **Bitcoin Cash** | BIP44 (legacy form) | `1…` (or `bitcoincash:q…`) |
+| **Bitcoin SV** | BIP44 | `1…` |
+| **Litecoin** | BIP44 / BIP49 / BIP84 | `L…` `M…` `ltc1q…` |
+| **Dogecoin** | BIP44 | `D…` |
+| **Dash** | BIP44 | `X…` |
+| **Zcash (transparent)** | BIP44 | `t1…` |
+| **Ethereum + EVM** (BSC, Polygon, Avalanche-C, Arbitrum, Optimism, Base, …) | BIP44 | `0x…` |
+| **Tron** | BIP44 | `T…` |
+
+EVM chains share the same address as Ethereum from the same seed — just give any EVM address.
+
+Out of scope: Solana, Cardano, Polkadot, Cosmos, Stellar (different curves — ed25519 / sr25519, not secp256k1).
+
+## Installation
+
+```bash
+cargo install --git https://github.com/femto7/seedcrypt-recover
+```
+
+Or from a clone:
+
+```bash
+git clone https://github.com/femto7/seedcrypt-recover
+cd seedcrypt-recover
+cargo build --release
+./target/release/seedcrypt-recover --help
+```
+
+## Usage
+
+### Missing word(s)
+
+```bash
+seedcrypt-recover missing \
+  --mnemonic "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon ?" \
+  --address 0x9858EfFD232B4033E47d90003D41EC34EcaEda94
+```
+
+### Typo correction
+
+```bash
+seedcrypt-recover typo \
+  --mnemonic "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandun about" \
+  --address 0x9858EfFD232B4033E47d90003D41EC34EcaEda94
+```
+
+(Synthetic example using the well-known **abandon-about** BIP39 test vector — a public test seed used by every wallet for unit testing. Word 11 is intentionally typo'd `abandun` instead of `abandon`. The tool finds the substitution in seconds.)
+
+> ⚠️ **Never share your real seed phrase or address pair publicly.** This README intentionally uses a public test vector with no funds. If you copy-paste a real example anywhere (issue, blog, support thread), assume the funds at that address are immediately drained.
+
+### With BIP39 passphrase
+
+```bash
+seedcrypt-recover typo \
+  --mnemonic "..." \
+  --address "..." \
+  --passphrase "TREZOR"
+```
+
+### Wider scan range
+
+```bash
+seedcrypt-recover typo \
+  --mnemonic "..." \
+  --address "..." \
+  --account-end 4 \
+  --address-end 49
+```
+
+## Performance
+
+On a modern 8-core CPU, with one address checked per candidate:
+
+| Scenario | Candidates | Wall time |
+|----------|-----------:|----------:|
+| 1 missing word                                | 2,048     | < 1 sec |
+| 1 typo (12-word seed)                         | 24,576    | 5–15 sec |
+| 1 typo (24-word seed)                         | 49,152    | 10–30 sec |
+| 2 missing words at indices ≤ 100              | ~200,000  | 30–90 sec |
+| 2 missing words at indices ≤ 2048             | ~4 million | 5–15 min |
+| 3 missing words                               | ~8 billion | hours/days |
+
+Roughly the same order of magnitude as btcrecover. Both use `libsecp256k1` for the heavy lifting; the wrapping language (Rust vs Python) is a rounding error.
+
+## Security
+
+This is a recovery tool, not a wallet. It:
+
+- Never makes network calls.
+- Doesn't write the recovered seed to disk (unless you redirect stdout).
+- Doesn't run or call any binary other than what you compiled from the published source.
+- Verifies every candidate by re-deriving the BIP32/secp256k1 path (no false positives — the only way to "match" is for the entire derivation to actually produce the target address).
+
+That said: **run on an air-gapped machine** when recovering a seed that secures real funds. After recovery, **transfer funds to a new wallet**, since the recovered seed has now been in the memory of an internet-connected machine.
+
+## Library use
+
+The crate is also a `cdylib`, so you can call it from any language with C FFI (Flutter, Python, Node.js, Go, …).
+
+```rust
+use seedcrypt_recover::{recover_typo, RecoveryRequest, ValidationConfig, DerivationType};
+
+let req = RecoveryRequest {
+    seed_length: 12,
+    words: vec![/* … */],
+    validation: Some(ValidationConfig {
+        address: "0x...".into(),
+        kind: DerivationType::EthereumStandard,
+        passphrase: String::new(),
+        account_start: 0, account_end: 0,
+        address_start: 0, address_end: 0,
+    }),
+};
+let result = recover_typo(&req, |_| {});
+```
+
+## Acknowledgments
+
+- [btcrecover](https://github.com/3rdIteration/btcrecover) by gurnec / 3rdIteration — the canonical seed recovery tool, and the algorithmic reference for this implementation.
+- [Bitcoin Core's libsecp256k1](https://github.com/bitcoin-core/secp256k1) — used (via FFI) for all elliptic-curve math.
+- [rust-bitcoin](https://github.com/rust-bitcoin/rust-bitcoin) — type-safe Rust bindings to libsecp256k1 used by this crate.
+
+## License
+
+MIT — see [LICENSE](./LICENSE).
