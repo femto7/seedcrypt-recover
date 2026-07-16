@@ -1146,7 +1146,7 @@ pub struct RecoveryRequest {
     };
 ```
 
-5. In both `#[cfg(test)]` tests inside `recovery.rs` that construct `RecoveryRequest { .. }` (the three existing ones plus the one added in Task 5), add `allow_typo: false,` as a field.
+5. Every `#[cfg(test)]` test in `recovery.rs` that constructs `RecoveryRequest { .. }` needs `allow_typo: false,` added as a field — by the time this step runs there are 5 such tests (`recover_missing_one_word_with_address`, `recover_missing_two_words_still_works_after_refactor`, `recover_typo_canonical_vector`, plus 2 extra added during Task 5's code review: `recover_missing_checksum_only_no_validation`, `recover_missing_rejects_too_many_missing_words`), not the 3 originally anticipated when this task was drafted. Find every `RecoveryRequest {` in the test module and add the field to each.
 
 - [ ] **Step 5: Add a test proving combined search finds a 1-missing + 1-typo case**
 
@@ -1210,7 +1210,11 @@ Add to the `#[cfg(test)] mod tests` block in `src/recovery.rs`:
 - [ ] **Step 6: Run**
 
 Run: `cargo test recover_missing -- --nocapture`
-Expected: `4 passed` (one-word, two-word, combined-typo-found, combined-typo-not-found-without-flag).
+Expected: `6 passed` — the 4 original (one-word, two-word, combined-typo-found,
+combined-typo-not-found-without-flag) plus 2 extra tests added during Task 5's
+code review (`recover_missing_checksum_only_no_validation`,
+`recover_missing_rejects_too_many_missing_words`), which aren't in this
+task's own code block but exist in the file by the time this step runs.
 
 - [ ] **Step 7: Run the full suite**
 
