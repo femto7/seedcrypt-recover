@@ -6,7 +6,7 @@
 
 use crate::address::{derive_addresses, DerivationType};
 use crate::bip39::{mnemonic_to_seed, validate_checksum, word_index, words};
-use crate::candidate_space::{CandidateSpace, MissingSpace, TypoSpace};
+use crate::candidate_space::{MissingSpace, TypoSpace};
 use crate::search::run_chunked_search;
 use secp256k1::Secp256k1;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -311,5 +311,34 @@ mod tests {
         assert!(res.mnemonic.is_some(), "should find the typo correction");
         assert_eq!(res.mnemonic.as_ref().unwrap()[10], "abandon");
         assert!(!res.interrupted);
+    }
+
+    #[test]
+    fn recover_missing_checksum_only_no_validation() {
+        // No address validation — accepts the first checksum-valid fill.
+        let mut words: Vec<Option<String>> = vec![Some("abandon".to_string()); 11];
+        words.push(None);
+        let req = RecoveryRequest {
+            seed_length: 12,
+            words,
+            validation: None,
+        };
+        let res = recover_missing(&req, |_| {});
+        assert!(res.mnemonic.is_some(), "should find a checksum-valid fill");
+        assert!(!res.interrupted);
+    }
+
+    #[test]
+    fn recover_missing_rejects_too_many_missing_words() {
+        let mut words: Vec<Option<String>> = vec![Some("abandon".to_string()); 8];
+        words.extend(vec![None; 4]); // 4 missing — over the limit
+        let req = RecoveryRequest {
+            seed_length: 12,
+            words,
+            validation: None,
+        };
+        let res = recover_missing(&req, |_| {});
+        assert!(res.mnemonic.is_none());
+        assert_eq!(res.combinations_tested, 0);
     }
 }
