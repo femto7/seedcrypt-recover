@@ -2573,7 +2573,7 @@ Expected: prints `Resuming from checkpoint: 0/2048 candidates already tested (0.
 ```bash
 cargo run -- missing \
   --mnemonic "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon ?" \
-  --address 0x0000000000000000000000000000000000dEaD \
+  --address 0x000000000000000000000000000000000000dEaD \
   --resume /tmp/seedcrypt-test/cp.json
 ```
 Expected: `Error: Checkpoint at /tmp/seedcrypt-test/cp.json was saved for a different search (...). Refusing to resume.`
