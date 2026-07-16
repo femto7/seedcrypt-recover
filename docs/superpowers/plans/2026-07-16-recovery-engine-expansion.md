@@ -1619,10 +1619,16 @@ pub fn recover_reorder_resumable(
 }
 ```
 
-Update the `use crate::candidate_space::{...}` import line at the top of the file to include `ReorderSpace`:
+Update the `use crate::candidate_space::{...}` import line at the top of the file to include `ReorderSpace`. Note: the current import (post-Task-6) is
+`use crate::candidate_space::{MissingSpace, MissingTypoSpace, TypoSpace};` — it does **not**
+include `CandidateSpace` (removed in Task 6's fixup commit `fe86d91` because it was unused —
+`CandidateSpace` is only ever needed via `&dyn CandidateSpace` coercion, never named directly
+in `recovery.rs`). `recover_reorder_resumable`'s code below doesn't name `CandidateSpace`
+either, so do **not** re-add it — that would reintroduce the exact same unused-import warning
+a third time. Add only `ReorderSpace`:
 
 ```rust
-use crate::candidate_space::{CandidateSpace, MissingSpace, MissingTypoSpace, ReorderSpace, TypoSpace};
+use crate::candidate_space::{MissingSpace, MissingTypoSpace, ReorderSpace, TypoSpace};
 ```
 
 - [ ] **Step 4: Add an integration test using the abandon…about vector with two swapped words**
