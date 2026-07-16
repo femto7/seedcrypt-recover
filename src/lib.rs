@@ -13,6 +13,7 @@ pub mod address;
 pub mod lehmer;
 pub mod candidate_space;
 pub mod search;
+pub mod checkpoint;
 pub mod recovery;
 
 pub use address::{AddressInfo, Coin, DerivationType};
