@@ -23,11 +23,20 @@ pub struct MissingSpace {
 }
 
 impl CandidateSpace for MissingSpace {
+    /// `2048^missing_positions.len()`. Callers must keep
+    /// `missing_positions.len()` small (in practice `<= 3-4`, matching the
+    /// CLI's own guard on the `missing` subcommand) — since 2048 == 2^11,
+    /// `len() >= 6` means `11 * len() >= 66`, which exceeds 64 bits and
+    /// silently wraps (rather than panicking or erroring) because this
+    /// crate's release profile does not enable `overflow-checks`. This
+    /// matters for callers going through the `cdylib` FFI surface directly,
+    /// which aren't protected by the CLI's guard.
     fn total(&self) -> u64 {
         2048u64.pow(self.missing_positions.len() as u32)
     }
 
     fn candidate_at(&self, index: u64) -> Vec<u16> {
+        assert!(index < self.total(), "index out of range");
         let mut out = self.known_indices.clone();
         let m = self.missing_positions.len();
         let mut rem = index;
