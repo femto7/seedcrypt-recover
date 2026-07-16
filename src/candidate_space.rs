@@ -132,6 +132,10 @@ impl CandidateSpace for MissingTypoSpace {
 /// Wrong-order recovery: all words known, but the words at
 /// `permute_positions` might be in the wrong order among themselves. Every
 /// other position is fixed.
+///
+/// `permute_positions` must contain distinct, in-bounds indices into
+/// `base_indices` — the caller (CLI layer) is responsible for validating
+/// this; an out-of-range or duplicate index will panic.
 pub struct ReorderSpace {
     pub base_indices: Vec<u16>,
     pub permute_positions: Vec<usize>,

@@ -18,5 +18,6 @@ pub mod recovery;
 pub use address::{AddressInfo, Coin, DerivationType};
 pub use bip39::{validate_mnemonic, mnemonic_to_seed, BIP39_WORDLIST};
 pub use recovery::{
-    recover_missing, recover_typo, RecoveryRequest, RecoveryResult, ValidationConfig,
+    recover_missing, recover_reorder, recover_typo, RecoveryRequest, RecoveryResult,
+    ValidationConfig,
 };
