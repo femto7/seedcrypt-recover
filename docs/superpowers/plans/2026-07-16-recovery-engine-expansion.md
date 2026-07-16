@@ -2130,6 +2130,14 @@ use std::path::PathBuf;
 
 (`hash_mnemonic_pattern` — added alongside `Checkpoint`'s `mnemonic_pattern_hash` field in Task 10's post-review fixup — is needed by all three `run_*` functions below, not just `hash_passphrase`.)
 
+Also update the existing `use std::sync::atomic::{AtomicU64, Ordering};` line (already present in `main.rs` since before this task) to add `AtomicBool`:
+
+```rust
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+```
+
+(`install_stop_flag`, added below in this same step, returns `Arc<AtomicBool>` — without this, the crate won't compile with "cannot find type `AtomicBool` in this scope.")
+
 Add this helper function (after `make_progress_bar`, before `run_missing`):
 
 ```rust
@@ -2509,7 +2517,7 @@ Update the `Command::Reorder { .. }` match arm:
 
 - [ ] **Step 6: Consolidate the imports**
 
-`main.rs` now calls the `_resumable` variants exclusively via their fully-qualified `seedcrypt_recover::recovery::` path (see Steps 3-5 above), so the plain `use ... recovery::{recover_missing, recover_typo}` names from the original file are now unused, and the standalone `use seedcrypt_recover::checkpoint::{hash_passphrase, Checkpoint};` line added in Step 2 needs to move into the same block instead of staying separate (two `use` paths naming the same items would fail to compile with "the name `Checkpoint` is defined multiple times").
+`main.rs` now calls the `_resumable` variants exclusively via their fully-qualified `seedcrypt_recover::recovery::` path (see Steps 3-5 above), so the plain `use ... recovery::{recover_missing, recover_typo}` names from the original file are now unused, and the standalone `use seedcrypt_recover::checkpoint::{hash_mnemonic_pattern, hash_passphrase, Checkpoint};` line added in Step 2 needs to move into the same block instead of staying separate (two `use` paths naming the same items would fail to compile with "the name `Checkpoint` is defined multiple times").
 
 **Delete** the standalone import line added in Step 2:
 
