@@ -6,7 +6,7 @@
 
 use crate::address::{derive_addresses, DerivationType};
 use crate::bip39::{mnemonic_to_seed, validate_checksum, word_index, words};
-use crate::candidate_space::{CandidateSpace, MissingSpace, MissingTypoSpace, TypoSpace};
+use crate::candidate_space::{MissingSpace, MissingTypoSpace, TypoSpace};
 use crate::search::run_chunked_search;
 use secp256k1::Secp256k1;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +16,15 @@ use std::sync::Mutex;
 /// impractical (multi-hour-plus even with validation short-circuiting).
 /// Plain `missing` (no --allow-typo) keeps its own existing
 /// `missing_positions.len() > 3` guard, unchanged, for regression safety.
+///
+/// In practice this means `--allow-typo` is only useful with exactly 1
+/// missing word — for any seed length, 2+ missing words combined with a
+/// typo already exceeds this cap by ~2 orders of magnitude (e.g. a
+/// 12-word seed with 2 missing + typo has a minimum possible total of
+/// ~8.6×10^10, ~172x over 500M). This is intentional, not a bug — but it
+/// means the guard will silently reject before searching in that case,
+/// which the CLI layer (Task 7) needs to surface clearly rather than let
+/// it look identical to "searched and found nothing."
 const MAX_COMBINED_CANDIDATES: u64 = 500_000_000;
 
 /// Optional address-based filter. When set, the recovery short-circuits at
