@@ -954,6 +954,18 @@ git commit -m "refactor: rebuild recover_missing/recover_typo on CandidateSpace 
 **Files:**
 - Modify: `src/candidate_space.rs` (add `MissingTypoSpace`)
 - Modify: `src/recovery.rs` (add `allow_typo` support, complexity guard, `use` fix from Task 5)
+- Modify: `src/main.rs` (minimal compile fix only — see Step 4, item 6)
+
+Note found during execution: adding a non-optional `allow_typo: bool` field to
+`RecoveryRequest` breaks both of `main.rs`'s existing `RecoveryRequest { .. }`
+struct literals (`run_missing` and `run_typo`), since this is a `[[bin]]` +
+`[lib]` package where `cargo test`/`cargo build` always compiles both
+targets. `run_missing`'s call site gets fully replaced by Task 7 anyway (no
+conflict), but `run_typo`'s is not touched again until Task 11 — five tasks
+later. Without a fix here, the whole crate fails to compile from this task
+through Task 10. Task 6 therefore includes a minimal, mechanical
+`allow_typo: false,` patch to both call sites — not the actual CLI flag work,
+which stays exactly where Tasks 7/11 already own it.
 
 - [ ] **Step 1: Write the failing test for `MissingTypoSpace`**
 
@@ -1166,6 +1178,50 @@ pub struct RecoveryRequest {
 
 5. Every `#[cfg(test)]` test in `recovery.rs` that constructs `RecoveryRequest { .. }` needs `allow_typo: false,` added as a field — by the time this step runs there are 5 such tests (`recover_missing_one_word_with_address`, `recover_missing_two_words_still_works_after_refactor`, `recover_typo_canonical_vector`, plus 2 extra added during Task 5's code review: `recover_missing_checksum_only_no_validation`, `recover_missing_rejects_too_many_missing_words`), not the 3 originally anticipated when this task was drafted. Find every `RecoveryRequest {` in the test module and add the field to each.
 
+6. **Minimal `main.rs` compile fix** (see the note under this task's **Files** list above for why this is needed). In `src/main.rs`, `run_missing`'s `RecoveryRequest` literal:
+
+```rust
+    let req = RecoveryRequest {
+        seed_length: n,
+        words,
+        validation,
+    };
+```
+
+becomes:
+
+```rust
+    let req = RecoveryRequest {
+        seed_length: n,
+        words,
+        validation,
+        allow_typo: false,
+    };
+```
+
+and `run_typo`'s `RecoveryRequest` literal:
+
+```rust
+    let req = RecoveryRequest {
+        seed_length: n,
+        words,
+        validation: Some(validation),
+    };
+```
+
+becomes:
+
+```rust
+    let req = RecoveryRequest {
+        seed_length: n,
+        words,
+        validation: Some(validation),
+        allow_typo: false,
+    };
+```
+
+Nothing else in `main.rs` changes — no new flags, no signature changes. This is purely "keep the crate compiling"; Task 7 replaces `run_missing`'s literal (including this line) with real `--allow-typo` wiring, and Task 11 does the same for `run_typo`.
+
 - [ ] **Step 5: Add a test proving combined search finds a 1-missing + 1-typo case**
 
 Add to the `#[cfg(test)] mod tests` block in `src/recovery.rs`:
@@ -1242,7 +1298,7 @@ Expected: all pass.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/candidate_space.rs src/recovery.rs
+git add src/candidate_space.rs src/recovery.rs src/main.rs
 git commit -m "feat: add MissingTypoSpace and --allow-typo combined search"
 ```
 
