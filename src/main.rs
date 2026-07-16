@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use seedcrypt_recover::{
     address::detect,
-    recovery::{recover_missing, recover_typo, RecoveryRequest, ValidationConfig},
+    recovery::{recover_missing, recover_typo, recover_reorder, RecoveryRequest, ValidationConfig},
 };
 
 #[derive(Parser, Debug)]
@@ -65,6 +65,29 @@ enum Command {
         #[arg(long, default_value_t = 9)]
         address_end: u32,
     },
+
+    /// Recover the correct order of a subset of positions whose words are
+    /// known but possibly shuffled. All other positions are fixed.
+    Reorder {
+        #[arg(long)]
+        mnemonic: String,
+        /// 1-indexed, comma-separated positions to permute (e.g. 3,7,9,10).
+        /// 2-10 positions.
+        #[arg(long, value_delimiter = ',')]
+        permute_positions: Vec<usize>,
+        #[arg(long)]
+        address: String,
+        #[arg(long, default_value = "")]
+        passphrase: String,
+        #[arg(long, default_value_t = 0)]
+        account_start: u32,
+        #[arg(long, default_value_t = 0)]
+        account_end: u32,
+        #[arg(long, default_value_t = 0)]
+        address_start: u32,
+        #[arg(long, default_value_t = 9)]
+        address_end: u32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -99,6 +122,25 @@ fn main() -> Result<()> {
             address_end,
         } => run_typo(
             &mnemonic,
+            &address,
+            &passphrase,
+            account_start,
+            account_end,
+            address_start,
+            address_end,
+        ),
+        Command::Reorder {
+            mnemonic,
+            permute_positions,
+            address,
+            passphrase,
+            account_start,
+            account_end,
+            address_start,
+            address_end,
+        } => run_reorder(
+            &mnemonic,
+            permute_positions,
             &address,
             &passphrase,
             account_start,
@@ -276,6 +318,80 @@ fn run_typo(
         allow_typo: false,
     };
     let result = recover_typo(&req, progress);
+    pb.finish_with_message("done");
+
+    print_result(result.mnemonic, result.combinations_tested, result.elapsed_ms)
+}
+
+fn run_reorder(
+    mnemonic: &str,
+    permute_positions_1indexed: Vec<usize>,
+    address: &str,
+    passphrase: &str,
+    account_start: u32,
+    account_end: u32,
+    address_start: u32,
+    address_end: u32,
+) -> Result<()> {
+    let words: Vec<String> = mnemonic.split_whitespace().map(|w| w.to_ascii_lowercase()).collect();
+    let n = words.len();
+    if !matches!(n, 12 | 15 | 18 | 21 | 24) {
+        return Err(anyhow!("Mnemonic must have 12/15/18/21/24 words (got {n})"));
+    }
+
+    let k = permute_positions_1indexed.len();
+    if k < 2 {
+        return Err(anyhow!("--permute-positions needs at least 2 positions (got {k})"));
+    }
+    if k > 10 {
+        return Err(anyhow!(
+            "--permute-positions has {k} positions ({k}! candidates) — impractical. Narrow it to 10 or fewer."
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut permute_positions = Vec::with_capacity(k);
+    for &p in &permute_positions_1indexed {
+        if p == 0 || p > n {
+            return Err(anyhow!("Position {p} is out of range for a {n}-word seed (must be 1..={n})"));
+        }
+        if !seen.insert(p) {
+            return Err(anyhow!("Position {p} listed more than once in --permute-positions"));
+        }
+        permute_positions.push(p - 1); // convert to 0-indexed
+    }
+
+    let validation = build_validation(
+        Some(address),
+        passphrase,
+        account_start,
+        account_end,
+        address_start,
+        address_end,
+    )?
+    .ok_or_else(|| anyhow!("reorder recovery requires --address"))?;
+
+    println!(
+        "{} Searching {} permutation(s) of {} marked position(s) in a {}-word seed against {}",
+        style("⚙").cyan(),
+        seedcrypt_recover::lehmer::factorial(k as u64),
+        k,
+        n,
+        style(&validation.address).yellow(),
+    );
+
+    let total = seedcrypt_recover::lehmer::factorial(k as u64);
+    let pb = make_progress_bar(total);
+    let pb_clone = pb.clone();
+    let last = Arc::new(AtomicU64::new(0));
+    let last_clone = last.clone();
+    let progress = move |tested: u64| {
+        let prev = last_clone.swap(tested, Ordering::Relaxed);
+        if tested > prev {
+            pb_clone.set_position(tested);
+        }
+    };
+
+    let result = recover_reorder(&words, permute_positions, Some(validation), progress);
     pb.finish_with_message("done");
 
     print_result(result.mnemonic, result.combinations_tested, result.elapsed_ms)
