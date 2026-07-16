@@ -42,6 +42,10 @@ enum Command {
         address_start: u32,
         #[arg(long, default_value_t = 9)]
         address_end: u32,
+        /// Also try substituting one known word (in addition to filling
+        /// `?` slots) — combined missing + typo search.
+        #[arg(long)]
+        allow_typo: bool,
     },
 
     /// Find a single-word typo by trying all 2048 substitutions × N positions.
@@ -74,6 +78,7 @@ fn main() -> Result<()> {
             account_end,
             address_start,
             address_end,
+            allow_typo,
         } => run_missing(
             &mnemonic,
             address.as_deref(),
@@ -82,6 +87,7 @@ fn main() -> Result<()> {
             account_end,
             address_start,
             address_end,
+            allow_typo,
         ),
         Command::Typo {
             mnemonic,
@@ -158,6 +164,7 @@ fn run_missing(
     account_end: u32,
     address_start: u32,
     address_end: u32,
+    allow_typo: bool,
 ) -> Result<()> {
     let words = parse_with_unknowns(mnemonic);
     let n = words.len();
@@ -184,18 +191,20 @@ fn run_missing(
     )?;
 
     println!(
-        "{} Searching {} missing word(s) in a {}-word seed{}",
+        "{} Searching {} missing word(s) in a {}-word seed{}{}",
         style("⚙").cyan(),
         missing_count,
         n,
-        if validation.is_some() {
-            " with address validation"
-        } else {
-            " (checksum only)"
-        }
+        if validation.is_some() { " with address validation" } else { " (checksum only)" },
+        if allow_typo { ", also allowing one typo among known words" } else { "" },
     );
 
-    let total = 2048u64.pow(missing_count as u32);
+    let known_count = n - missing_count;
+    let total: u64 = if allow_typo {
+        2048u64.pow(missing_count as u32) * (1 + known_count as u64 * 2048)
+    } else {
+        2048u64.pow(missing_count as u32)
+    };
     let pb = make_progress_bar(total);
     let pb_clone = pb.clone();
     let last = Arc::new(AtomicU64::new(0));
@@ -207,12 +216,7 @@ fn run_missing(
         }
     };
 
-    let req = RecoveryRequest {
-        seed_length: n,
-        words,
-        validation,
-        allow_typo: false,
-    };
+    let req = RecoveryRequest { seed_length: n, words, validation, allow_typo };
     let result = recover_missing(&req, progress);
     pb.finish_with_message("done");
 
