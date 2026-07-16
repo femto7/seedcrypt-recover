@@ -16,7 +16,7 @@
 
 - **Create** `src/lehmer.rs` — factorial + index↔permutation bijection. No dependencies on the rest of the crate; pure math, easy to isolate and property-test.
 - **Create** `src/candidate_space.rs` — the `CandidateSpace` trait and its four implementations (`MissingSpace`, `TypoSpace`, `MissingTypoSpace`, `ReorderSpace`).
-- **Create** `src/search.rs` — the shared chunked-parallel search runner (`run_chunked_search`) and the shared `try_candidate` closure builder, used by every recovery function so the address-validation logic isn't duplicated four times.
+- **Create** `src/search.rs` — the shared chunked-parallel search runner (`run_chunked_search`), used by every recovery function so the chunking/checkpoint-safety logic isn't duplicated four times. The shared `try_candidate` closure builder (`make_try_candidate`) lives in `src/recovery.rs` instead (Task 5) — it's BIP39/address-domain logic (checksum validation, mnemonic reconstruction, address derivation) that `search.rs` has no business knowing about.
 - **Create** `src/checkpoint.rs` — `Checkpoint` struct, signature matching, atomic save/load.
 - **Modify** `src/recovery.rs` — `recover_missing` and `recover_typo` refactored onto `MissingSpace`/`TypoSpace` + `run_chunked_search` (regression-safe); add `allow_typo` support via `MissingTypoSpace`; add `recover_reorder` via `ReorderSpace`. All three gain `resume_index`/checkpoint parameters.
 - **Modify** `src/lib.rs` — export the new modules and public items.
@@ -415,10 +415,15 @@ pub fn run_chunked_search(
             }
         });
         chunk_start = chunk_end;
-        on_chunk_complete(chunk_start);
+        // Check `found` BEFORE checkpointing: if a match landed partway
+        // through this chunk, the watermark must not claim the whole chunk
+        // was tested (that would let a future resume silently skip the
+        // untested tail). Bug found + fixed during Task 4's code review —
+        // see git history for the empirical repro.
         if found.load(Ordering::Relaxed) {
             break;
         }
+        on_chunk_complete(chunk_start);
     }
 
     SearchOutcome {
@@ -781,12 +786,20 @@ pub fn recover_missing_resumable(
 
     let outcome = run_chunked_search(&space, resume_index, &found, stop, try_candidate, on_chunk_complete, progress);
 
-    RecoveryResult {
+    // Bound to a local before returning: rustc's borrowck cannot prove the
+    // MutexGuard temporary from `.lock().unwrap()` is safe to drop when
+    // this struct literal is the function's tail expression (E0597,
+    // "temporary is part of an expression at the end of a block") — even
+    // though `.take()` returns a fully owned value with no borrow. Binding
+    // to `result` first forces the guard to drop within this `let`
+    // statement, before `result_lock` itself is dropped at function end.
+    let result = RecoveryResult {
         mnemonic: result_lock.lock().unwrap().take(),
         combinations_tested: outcome.tested,
         elapsed_ms: start.elapsed().as_millis(),
         interrupted: outcome.interrupted,
-    }
+    };
+    result
 }
 
 /// Try replacing each position with all 2048 BIP39 words (single typo).
@@ -818,12 +831,20 @@ pub fn recover_typo_resumable(
 
     let outcome = run_chunked_search(&space, resume_index, &found, stop, try_candidate, on_chunk_complete, progress);
 
-    RecoveryResult {
+    // Bound to a local before returning: rustc's borrowck cannot prove the
+    // MutexGuard temporary from `.lock().unwrap()` is safe to drop when
+    // this struct literal is the function's tail expression (E0597,
+    // "temporary is part of an expression at the end of a block") — even
+    // though `.take()` returns a fully owned value with no borrow. Binding
+    // to `result` first forces the guard to drop within this `let`
+    // statement, before `result_lock` itself is dropped at function end.
+    let result = RecoveryResult {
         mnemonic: result_lock.lock().unwrap().take(),
         combinations_tested: outcome.tested,
         elapsed_ms: start.elapsed().as_millis(),
         interrupted: outcome.interrupted,
-    }
+    };
+    result
 }
 
 #[cfg(test)]
@@ -1503,12 +1524,20 @@ pub fn recover_reorder_resumable(
 
     let outcome = run_chunked_search(&space, resume_index, &found, stop, try_candidate, on_chunk_complete, progress);
 
-    RecoveryResult {
+    // Bound to a local before returning: rustc's borrowck cannot prove the
+    // MutexGuard temporary from `.lock().unwrap()` is safe to drop when
+    // this struct literal is the function's tail expression (E0597,
+    // "temporary is part of an expression at the end of a block") — even
+    // though `.take()` returns a fully owned value with no borrow. Binding
+    // to `result` first forces the guard to drop within this `let`
+    // statement, before `result_lock` itself is dropped at function end.
+    let result = RecoveryResult {
         mnemonic: result_lock.lock().unwrap().take(),
         combinations_tested: outcome.tested,
         elapsed_ms: start.elapsed().as_millis(),
         interrupted: outcome.interrupted,
-    }
+    };
+    result
 }
 ```
 
