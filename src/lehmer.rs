@@ -11,9 +11,10 @@ pub fn factorial(n: u64) -> u64 {
 
 /// Returns the `index`-th permutation of `items`, in the factorial number
 /// system over the *given* order (not sorted order). `index` must be
-/// `< factorial(items.len())` — out-of-range indices wrap via modulo in
-/// debug-safe fashion by construction of callers (see `ReorderSpace`),
-/// so this function does not itself validate the bound.
+/// `< factorial(items.len())`. Out-of-range indices panic (via
+/// `Vec::remove`'s bounds check) rather than wrapping — this function does
+/// not itself validate the bound, so keeping `index` in range is the
+/// caller's responsibility (see `ReorderSpace`).
 pub fn nth_permutation<T: Clone>(items: &[T], index: u64) -> Vec<T> {
     let mut pool: Vec<T> = items.to_vec();
     let mut result = Vec::with_capacity(items.len());
