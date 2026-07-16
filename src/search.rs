@@ -58,10 +58,10 @@ pub fn run_chunked_search(
             }
         });
         chunk_start = chunk_end;
-        on_chunk_complete(chunk_start);
         if found.load(Ordering::Relaxed) {
             break;
         }
+        on_chunk_complete(chunk_start);
     }
 
     SearchOutcome {
@@ -168,5 +168,60 @@ mod tests {
             *watermarks.lock().unwrap(),
             vec![100_000, 200_000, 250_000]
         );
+    }
+
+    /// Regression test: if `found` is set partway through a chunk (the
+    /// normal case in checksum-only mode, where the first checksum-valid
+    /// candidate is accepted), `on_chunk_complete` must NOT be called for
+    /// that chunk at all — reporting the full chunk boundary as the
+    /// watermark would claim candidates were tested that never were,
+    /// which is exactly the failure mode checkpoint/resume must avoid.
+    #[test]
+    fn found_mid_chunk_does_not_report_full_chunk_watermark() {
+        let space = IdentitySpace(250_000); // 3 chunks: 100k, 100k, 50k
+        let found = AtomicBool::new(false);
+        let stop = AtomicBool::new(false);
+        let watermarks: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let tested_count = Mutex::new(0u64);
+
+        // Single-threaded pool: makes execution of the first chunk
+        // effectively sequential, so the trigger index is reached before
+        // any later index in the same chunk is tested.
+        let trigger_at: u16 = 40_000;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+
+        let outcome = pool.install(|| {
+            run_chunked_search(
+                &space,
+                0,
+                &found,
+                &stop,
+                |c| {
+                    *tested_count.lock().unwrap() += 1;
+                    if c[0] == trigger_at {
+                        found.store(true, Ordering::Relaxed);
+                        true
+                    } else {
+                        false
+                    }
+                },
+                |w| watermarks.lock().unwrap().push(w),
+                |_| {},
+            )
+        });
+
+        // Only a prefix of the first chunk was actually tested.
+        assert!(outcome.tested <= trigger_at as u64 + 1);
+        assert!(outcome.tested < CHUNK_SIZE);
+        assert_eq!(*tested_count.lock().unwrap(), outcome.tested);
+
+        // The bug: on_chunk_complete used to fire with the full 100_000
+        // chunk boundary even though `found` was set at candidate 40_000.
+        // With the fix, the interrupted chunk is never reported complete.
+        assert!(!watermarks.lock().unwrap().contains(&CHUNK_SIZE));
+        assert!(watermarks.lock().unwrap().is_empty());
     }
 }
