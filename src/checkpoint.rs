@@ -12,7 +12,15 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub mode: String,
-    pub mnemonic_pattern: String,
+    /// SHA-256 hex digest of the mnemonic pattern as given (with `?`s for
+    /// `missing` mode, or the full mnemonic plus permute-positions for
+    /// `typo`/`reorder`). Hashed, not stored in plaintext: for `typo` and
+    /// `reorder` mode every word is known, so the "pattern" IS the user's
+    /// complete real seed phrase — this crate's threat model
+    /// (`src/lib.rs`: "All seed material stays in process memory") means it
+    /// gets the same never-plaintext-on-disk treatment as the passphrase
+    /// below, not just the passphrase.
+    pub mnemonic_pattern_hash: String,
     pub address: String,
     /// SHA-256 hex digest of the passphrase — never the plaintext, so a
     /// checkpoint file doesn't carry an extra copy of a sensitive value.
@@ -32,12 +40,24 @@ pub fn hash_passphrase(passphrase: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// SHA-256 hex digest of a mnemonic pattern string. Same digest as
+/// `hash_passphrase` — a distinct name at call sites documents *why* the
+/// mnemonic pattern is hashed (it's the user's real seed phrase for
+/// `typo`/`reorder` mode) rather than looking like a copy-paste of the
+/// passphrase hashing.
+pub fn hash_mnemonic_pattern(pattern: &str) -> String {
+    hash_passphrase(pattern)
+}
+
 impl Checkpoint {
     /// True if `other`'s search parameters (everything except the mutable
-    /// progress fields) match this checkpoint's.
+    /// progress fields) match this checkpoint's. NOTE: if a future task
+    /// adds another identity field to `Checkpoint` (e.g. a derivation
+    /// type), it must be added to this comparison too, or `--resume` could
+    /// silently accept a checkpoint from a different search.
     pub fn matches_signature(&self, other: &Checkpoint) -> bool {
         self.mode == other.mode
-            && self.mnemonic_pattern == other.mnemonic_pattern
+            && self.mnemonic_pattern_hash == other.mnemonic_pattern_hash
             && self.address == other.address
             && self.passphrase_hash == other.passphrase_hash
             && self.account_start == other.account_start
@@ -47,11 +67,18 @@ impl Checkpoint {
     }
 
     /// Atomic write: write to a `.tmp` sibling then rename over the target,
-    /// so a crash mid-write never leaves a corrupt checkpoint on disk.
+    /// so a crash mid-write never leaves a corrupt checkpoint on disk. The
+    /// sibling name is built by *appending* `.tmp` to the full filename
+    /// (not `Path::with_extension`, which *replaces* the last extension —
+    /// if `path` itself already ended in `.tmp`, that would make
+    /// `tmp_path == path` and silently break the atomicity guarantee this
+    /// function exists to provide).
     pub fn save(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| anyhow!("Could not serialize checkpoint: {e}"))?;
-        let tmp_path = path.with_extension("tmp");
+        let mut tmp_name = path.as_os_str().to_os_string();
+        tmp_name.push(".tmp");
+        let tmp_path = std::path::PathBuf::from(tmp_name);
         {
             let mut f = fs::File::create(&tmp_path)
                 .map_err(|e| anyhow!("Could not create {}: {e}", tmp_path.display()))?;
@@ -79,7 +106,7 @@ mod tests {
     fn sample(resume_index: u64) -> Checkpoint {
         Checkpoint {
             mode: "missing".into(),
-            mnemonic_pattern: "abandon abandon ?".into(),
+            mnemonic_pattern_hash: hash_mnemonic_pattern("abandon abandon ?"),
             address: "0xdead".into(),
             passphrase_hash: hash_passphrase(""),
             account_start: 0,
