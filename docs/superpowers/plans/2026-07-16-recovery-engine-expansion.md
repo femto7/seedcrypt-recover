@@ -331,7 +331,7 @@ pub mod recovery;
 - [ ] **Step 3: Run the tests**
 
 Run: `cargo test candidate_space:: -- --nocapture`
-Expected: `4 passed`.
+Expected: `3 passed` (`missing_space_total_and_bijection`, `missing_space_all_candidates_distinct_small`, `typo_space_total_and_positions`).
 
 - [ ] **Step 4: Commit**
 
