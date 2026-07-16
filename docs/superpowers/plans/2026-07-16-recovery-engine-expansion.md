@@ -1897,7 +1897,15 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub mode: String,
-    pub mnemonic_pattern: String,
+    /// SHA-256 hex digest of the mnemonic pattern as given (with `?`s for
+    /// `missing` mode, or the full mnemonic plus permute-positions for
+    /// `typo`/`reorder`). Hashed, not stored in plaintext: for `typo` and
+    /// `reorder` mode every word is known, so the "pattern" IS the user's
+    /// complete real seed phrase — this crate's threat model
+    /// (`src/lib.rs`: "All seed material stays in process memory") means it
+    /// gets the same never-plaintext-on-disk treatment as the passphrase
+    /// below, not just the passphrase.
+    pub mnemonic_pattern_hash: String,
     pub address: String,
     /// SHA-256 hex digest of the passphrase — never the plaintext, so a
     /// checkpoint file doesn't carry an extra copy of a sensitive value.
@@ -1917,12 +1925,24 @@ pub fn hash_passphrase(passphrase: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// SHA-256 hex digest of a mnemonic pattern string. Same digest as
+/// `hash_passphrase` — a distinct name at call sites documents *why* the
+/// mnemonic pattern is hashed (it's the user's real seed phrase for
+/// `typo`/`reorder` mode) rather than looking like a copy-paste of the
+/// passphrase hashing.
+pub fn hash_mnemonic_pattern(pattern: &str) -> String {
+    hash_passphrase(pattern)
+}
+
 impl Checkpoint {
     /// True if `other`'s search parameters (everything except the mutable
-    /// progress fields) match this checkpoint's.
+    /// progress fields) match this checkpoint's. NOTE: if a future task
+    /// adds another identity field to `Checkpoint` (e.g. a derivation
+    /// type), it must be added to this comparison too, or `--resume` could
+    /// silently accept a checkpoint from a different search.
     pub fn matches_signature(&self, other: &Checkpoint) -> bool {
         self.mode == other.mode
-            && self.mnemonic_pattern == other.mnemonic_pattern
+            && self.mnemonic_pattern_hash == other.mnemonic_pattern_hash
             && self.address == other.address
             && self.passphrase_hash == other.passphrase_hash
             && self.account_start == other.account_start
@@ -1932,11 +1952,18 @@ impl Checkpoint {
     }
 
     /// Atomic write: write to a `.tmp` sibling then rename over the target,
-    /// so a crash mid-write never leaves a corrupt checkpoint on disk.
+    /// so a crash mid-write never leaves a corrupt checkpoint on disk. The
+    /// sibling name is built by *appending* `.tmp` to the full filename
+    /// (not `Path::with_extension`, which *replaces* the last extension —
+    /// if `path` itself already ended in `.tmp`, that would make
+    /// `tmp_path == path` and silently break the atomicity guarantee this
+    /// function exists to provide).
     pub fn save(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| anyhow!("Could not serialize checkpoint: {e}"))?;
-        let tmp_path = path.with_extension("tmp");
+        let mut tmp_name = path.as_os_str().to_os_string();
+        tmp_name.push(".tmp");
+        let tmp_path = std::path::PathBuf::from(tmp_name);
         {
             let mut f = fs::File::create(&tmp_path)
                 .map_err(|e| anyhow!("Could not create {}: {e}", tmp_path.display()))?;
@@ -1964,7 +1991,7 @@ mod tests {
     fn sample(resume_index: u64) -> Checkpoint {
         Checkpoint {
             mode: "missing".into(),
-            mnemonic_pattern: "abandon abandon ?".into(),
+            mnemonic_pattern_hash: hash_mnemonic_pattern("abandon abandon ?"),
             address: "0xdead".into(),
             passphrase_hash: hash_passphrase(""),
             account_start: 0,
@@ -2097,9 +2124,11 @@ In `src/main.rs`, add these two fields to `Missing`, `Typo`, and `Reorder` (each
 Add near the top of `src/main.rs`, after the existing `use` block:
 
 ```rust
-use seedcrypt_recover::checkpoint::{hash_passphrase, Checkpoint};
+use seedcrypt_recover::checkpoint::{hash_mnemonic_pattern, hash_passphrase, Checkpoint};
 use std::path::PathBuf;
 ```
+
+(`hash_mnemonic_pattern` — added alongside `Checkpoint`'s `mnemonic_pattern_hash` field in Task 10's post-review fixup — is needed by all three `run_*` functions below, not just `hash_passphrase`.)
 
 Add this helper function (after `make_progress_bar`, before `run_missing`):
 
@@ -2214,7 +2243,7 @@ fn run_missing(
 
     let expected_sig = Checkpoint {
         mode: "missing".into(),
-        mnemonic_pattern: mnemonic.to_string(),
+        mnemonic_pattern_hash: hash_mnemonic_pattern(mnemonic),
         address: address.unwrap_or("").to_string(),
         passphrase_hash: hash_passphrase(passphrase),
         account_start, account_end, address_start, address_end,
@@ -2307,7 +2336,7 @@ fn run_typo(
 
     let expected_sig = Checkpoint {
         mode: "typo".into(),
-        mnemonic_pattern: mnemonic.to_string(),
+        mnemonic_pattern_hash: hash_mnemonic_pattern(mnemonic),
         address: address.to_string(),
         passphrase_hash: hash_passphrase(passphrase),
         account_start, account_end, address_start, address_end,
@@ -2420,7 +2449,7 @@ fn run_reorder(
     let permute_positions_str = permute_positions_1indexed.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
     let expected_sig = Checkpoint {
         mode: "reorder".into(),
-        mnemonic_pattern: format!("{mnemonic}|permute:{permute_positions_str}"),
+        mnemonic_pattern_hash: hash_mnemonic_pattern(&format!("{mnemonic}|permute:{permute_positions_str}")),
         address: address.to_string(),
         passphrase_hash: hash_passphrase(passphrase),
         account_start, account_end, address_start, address_end,
@@ -2485,7 +2514,7 @@ Update the `Command::Reorder { .. }` match arm:
 **Delete** the standalone import line added in Step 2:
 
 ```rust
-use seedcrypt_recover::checkpoint::{hash_passphrase, Checkpoint};
+use seedcrypt_recover::checkpoint::{hash_mnemonic_pattern, hash_passphrase, Checkpoint};
 ```
 
 (leave the `use std::path::PathBuf;` line from Step 2 as-is — that one stays).
@@ -2495,7 +2524,7 @@ Then **replace** the original top-of-file import block — the one that has read
 ```rust
 use seedcrypt_recover::{
     address::detect,
-    checkpoint::{hash_passphrase, Checkpoint},
+    checkpoint::{hash_mnemonic_pattern, hash_passphrase, Checkpoint},
     recovery::{RecoveryRequest, ValidationConfig},
 };
 ```
@@ -2512,7 +2541,7 @@ mkdir -p /tmp/seedcrypt-test
 cat > /tmp/seedcrypt-test/cp.json <<'EOF'
 {
   "mode": "missing",
-  "mnemonic_pattern": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon ?",
+  "mnemonic_pattern_hash": "02f74da913f56b37a259388f4bff1e5b3b2496a9fda9e1609c9773676142d483",
   "address": "0x9858EfFD232B4033E47d90003D41EC34EcaEda94",
   "passphrase_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "account_start": 0, "account_end": 0, "address_start": 0, "address_end": 9,
@@ -2521,7 +2550,7 @@ cat > /tmp/seedcrypt-test/cp.json <<'EOF'
 EOF
 ```
 
-Note: `passphrase_hash` above must exactly equal `hash_passphrase("")`, which is the well-known SHA-256 of the empty string: `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+Note: `passphrase_hash` above must exactly equal `hash_passphrase("")`, which is the well-known SHA-256 of the empty string: `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`. Likewise `mnemonic_pattern_hash` must exactly equal `hash_mnemonic_pattern("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon ?")`, i.e. the SHA-256 hex digest of that exact string: `02f74da913f56b37a259388f4bff1e5b3b2496a9fda9e1609c9773676142d483`.
 
 ```bash
 cargo run -- missing \
