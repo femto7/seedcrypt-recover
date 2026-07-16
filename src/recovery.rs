@@ -6,11 +6,17 @@
 
 use crate::address::{derive_addresses, DerivationType};
 use crate::bip39::{mnemonic_to_seed, validate_checksum, word_index, words};
-use crate::candidate_space::{MissingSpace, TypoSpace};
+use crate::candidate_space::{CandidateSpace, MissingSpace, MissingTypoSpace, TypoSpace};
 use crate::search::run_chunked_search;
 use secp256k1::Secp256k1;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+
+/// Above this many total candidates, a combined missing+typo search is
+/// impractical (multi-hour-plus even with validation short-circuiting).
+/// Plain `missing` (no --allow-typo) keeps its own existing
+/// `missing_positions.len() > 3` guard, unchanged, for regression safety.
+const MAX_COMBINED_CANDIDATES: u64 = 500_000_000;
 
 /// Optional address-based filter. When set, the recovery short-circuits at
 /// the first checksum-valid candidate whose derived addresses contain the
@@ -47,6 +53,10 @@ pub struct RecoveryRequest {
     /// `None` for missing slots, `Some(word)` for known.
     pub words: Vec<Option<String>>,
     pub validation: Option<ValidationConfig>,
+    /// When `true`, `recover_missing`/`recover_missing_resumable` also
+    /// tries substituting one known word (in addition to filling `?`
+    /// slots). Ignored by `recover_typo`/`recover_typo_resumable`.
+    pub allow_typo: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -156,20 +166,43 @@ pub fn recover_missing_resumable(
     on_chunk_complete: impl FnMut(u64),
 ) -> RecoveryResult {
     let start = std::time::Instant::now();
-    let Some((known_indices, missing_positions, _known_positions)) = resolve_words(req) else {
+    let Some((known_indices, missing_positions, known_positions)) = resolve_words(req) else {
         return RecoveryResult { mnemonic: None, combinations_tested: 0, elapsed_ms: start.elapsed().as_millis(), interrupted: false };
     };
     if missing_positions.is_empty() || missing_positions.len() > 3 {
         return RecoveryResult { mnemonic: None, combinations_tested: 0, elapsed_ms: start.elapsed().as_millis(), interrupted: false };
     }
 
-    let space = MissingSpace { known_indices, missing_positions };
+    let combined_total = if req.allow_typo {
+        let typo_choice_space = 1 + known_positions.len() as u64 * 2048;
+        let missing_total = 2048u64.pow(missing_positions.len() as u32);
+        Some(missing_total * typo_choice_space)
+    } else {
+        None
+    };
+    if let Some(total) = combined_total {
+        if total > MAX_COMBINED_CANDIDATES {
+            return RecoveryResult {
+                mnemonic: None,
+                combinations_tested: 0,
+                elapsed_ms: start.elapsed().as_millis(),
+                interrupted: false,
+            };
+        }
+    }
+
     let found = AtomicBool::new(false);
     let result_lock: Mutex<Option<Vec<String>>> = Mutex::new(None);
     let secp = Secp256k1::new();
     let try_candidate = make_try_candidate(&req.validation, &secp, &found, &result_lock);
 
-    let outcome = run_chunked_search(&space, resume_index, &found, stop, try_candidate, on_chunk_complete, progress);
+    let outcome = if req.allow_typo {
+        let space = MissingTypoSpace { known_indices, missing_positions, known_positions };
+        run_chunked_search(&space, resume_index, &found, stop, try_candidate, on_chunk_complete, progress)
+    } else {
+        let space = MissingSpace { known_indices, missing_positions };
+        run_chunked_search(&space, resume_index, &found, stop, try_candidate, on_chunk_complete, progress)
+    };
 
     // Bound to a local before returning: rustc's borrowck cannot prove the
     // MutexGuard temporary from `.lock().unwrap()` is safe to drop when
@@ -253,6 +286,7 @@ mod tests {
                 address_start: 0,
                 address_end: 0,
             }),
+            allow_typo: false,
         };
         let res = recover_missing(&req, |_| {});
         assert!(res.mnemonic.is_some(), "should find a match");
@@ -277,6 +311,7 @@ mod tests {
                 address_start: 0,
                 address_end: 0,
             }),
+            allow_typo: false,
         };
         let res = recover_missing(&req, |_| {});
         assert!(res.mnemonic.is_some());
@@ -306,6 +341,7 @@ mod tests {
                 address_start: 0,
                 address_end: 0,
             }),
+            allow_typo: false,
         };
         let res = recover_typo(&req, |_| {});
         assert!(res.mnemonic.is_some(), "should find the typo correction");
@@ -322,6 +358,7 @@ mod tests {
             seed_length: 12,
             words,
             validation: None,
+            allow_typo: false,
         };
         let res = recover_missing(&req, |_| {});
         assert!(res.mnemonic.is_some(), "should find a checksum-valid fill");
@@ -336,9 +373,63 @@ mod tests {
             seed_length: 12,
             words,
             validation: None,
+            allow_typo: false,
         };
         let res = recover_missing(&req, |_| {});
         assert!(res.mnemonic.is_none());
         assert_eq!(res.combinations_tested, 0);
+    }
+
+    #[test]
+    fn recover_missing_allow_typo_finds_combined_error() {
+        // 1 missing word (position 11, the "?") AND a typo at position 10
+        // ("apple" instead of "abandon") in the same search.
+        let mut words: Vec<Option<String>> = vec![Some("abandon".to_string()); 10];
+        words.push(Some("apple".to_string())); // typo
+        words.push(None); // missing
+        let req = RecoveryRequest {
+            seed_length: 12,
+            words,
+            validation: Some(ValidationConfig {
+                address: "0x9858EfFD232B4033E47d90003D41EC34EcaEda94".into(),
+                kind: DerivationType::EthereumStandard,
+                passphrase: String::new(),
+                account_start: 0,
+                account_end: 0,
+                address_start: 0,
+                address_end: 0,
+            }),
+            allow_typo: true,
+        };
+        let res = recover_missing(&req, |_| {});
+        assert!(res.mnemonic.is_some(), "should find the combined match");
+        assert_eq!(res.mnemonic.as_ref().unwrap()[10], "abandon");
+        assert_eq!(res.mnemonic.as_ref().unwrap()[11], "about");
+    }
+
+    #[test]
+    fn recover_missing_without_allow_typo_ignores_typo_positions() {
+        // Same broken input as above, but allow_typo: false — the search
+        // space doesn't cover fixing the typo, so it must NOT find a match
+        // (regression: allow_typo: false must behave exactly as before).
+        let mut words: Vec<Option<String>> = vec![Some("abandon".to_string()); 10];
+        words.push(Some("apple".to_string()));
+        words.push(None);
+        let req = RecoveryRequest {
+            seed_length: 12,
+            words,
+            validation: Some(ValidationConfig {
+                address: "0x9858EfFD232B4033E47d90003D41EC34EcaEda94".into(),
+                kind: DerivationType::EthereumStandard,
+                passphrase: String::new(),
+                account_start: 0,
+                account_end: 0,
+                address_start: 0,
+                address_end: 0,
+            }),
+            allow_typo: false,
+        };
+        let res = recover_missing(&req, |_| {});
+        assert!(res.mnemonic.is_none(), "typo-only-fixable case must not match without --allow-typo");
     }
 }

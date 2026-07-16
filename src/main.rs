@@ -211,6 +211,7 @@ fn run_missing(
         seed_length: n,
         words,
         validation,
+        allow_typo: false,
     };
     let result = recover_missing(&req, progress);
     pb.finish_with_message("done");
@@ -268,6 +269,7 @@ fn run_typo(
         seed_length: n,
         words,
         validation: Some(validation),
+        allow_typo: false,
     };
     let result = recover_typo(&req, progress);
     pb.finish_with_message("done");
