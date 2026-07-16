@@ -3,3 +3,4 @@
 *.pdb
 .idea/
 .vscode/
+.worktrees/
