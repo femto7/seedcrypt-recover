@@ -6,7 +6,7 @@
 
 use crate::address::{derive_addresses, DerivationType};
 use crate::bip39::{mnemonic_to_seed, validate_checksum, word_index, words};
-use crate::candidate_space::{MissingSpace, MissingTypoSpace, TypoSpace};
+use crate::candidate_space::{MissingSpace, MissingTypoSpace, ReorderSpace, TypoSpace};
 use crate::search::run_chunked_search;
 use secp256k1::Secp256k1;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -274,6 +274,65 @@ pub fn recover_typo_resumable(
     result
 }
 
+/// Wrong-order recovery: `permute_positions` (0-indexed) marks the
+/// positions whose words might be in the wrong order among themselves.
+/// Guarded to `2..=10` positions by the caller (CLI layer) — 10! ≈ 3.6M is
+/// the practical ceiling for this mode.
+pub fn recover_reorder(
+    words: &[String],
+    permute_positions: Vec<usize>,
+    validation: Option<ValidationConfig>,
+    progress: impl Fn(u64) + Sync + Send,
+) -> RecoveryResult {
+    recover_reorder_resumable(words, permute_positions, validation, 0, &AtomicBool::new(false), progress, |_| {})
+}
+
+/// Same as `recover_reorder`, plus resume support.
+pub fn recover_reorder_resumable(
+    words: &[String],
+    permute_positions: Vec<usize>,
+    validation: Option<ValidationConfig>,
+    resume_index: u64,
+    stop: &AtomicBool,
+    progress: impl Fn(u64) + Sync + Send,
+    on_chunk_complete: impl FnMut(u64),
+) -> RecoveryResult {
+    let start = std::time::Instant::now();
+    let map = word_index();
+    let mut base_indices = Vec::with_capacity(words.len());
+    for w in words {
+        match map.get(w.as_str()) {
+            Some(&idx) => base_indices.push(idx),
+            None => {
+                return RecoveryResult { mnemonic: None, combinations_tested: 0, elapsed_ms: start.elapsed().as_millis(), interrupted: false };
+            }
+        }
+    }
+
+    let space = ReorderSpace { base_indices, permute_positions };
+    let found = AtomicBool::new(false);
+    let result_lock: Mutex<Option<Vec<String>>> = Mutex::new(None);
+    let secp = Secp256k1::new();
+    let try_candidate = make_try_candidate(&validation, &secp, &found, &result_lock);
+
+    let outcome = run_chunked_search(&space, resume_index, &found, stop, try_candidate, on_chunk_complete, progress);
+
+    // Bound to a local before returning: rustc's borrowck cannot prove the
+    // MutexGuard temporary from `.lock().unwrap()` is safe to drop when
+    // this struct literal is the function's tail expression (E0597,
+    // "temporary is part of an expression at the end of a block") — even
+    // though `.take()` returns a fully owned value with no borrow. Binding
+    // to `result` first forces the guard to drop within this `let`
+    // statement, before `result_lock` itself is dropped at function end.
+    let result = RecoveryResult {
+        mnemonic: result_lock.lock().unwrap().take(),
+        combinations_tested: outcome.tested,
+        elapsed_ms: start.elapsed().as_millis(),
+        interrupted: outcome.interrupted,
+    };
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,5 +499,33 @@ mod tests {
         };
         let res = recover_missing(&req, |_| {});
         assert!(res.mnemonic.is_none(), "typo-only-fixable case must not match without --allow-typo");
+    }
+
+    #[test]
+    fn recover_reorder_swaps_two_words_back() {
+        // Real seed: abandon×11 + about. Swap positions 10 and 11 (0-indexed)
+        // so the mnemonic is given as abandon×10 + about + abandon — wrong
+        // order, all words individually valid BIP39 words.
+        let words: Vec<String> = vec![
+            "abandon".into(), "abandon".into(), "abandon".into(), "abandon".into(),
+            "abandon".into(), "abandon".into(), "abandon".into(), "abandon".into(),
+            "abandon".into(), "abandon".into(),
+            "about".into(),   // ← swapped
+            "abandon".into(), // ← swapped
+        ];
+        let validation = Some(ValidationConfig {
+            address: "0x9858EfFD232B4033E47d90003D41EC34EcaEda94".into(),
+            kind: DerivationType::EthereumStandard,
+            passphrase: String::new(),
+            account_start: 0,
+            account_end: 0,
+            address_start: 0,
+            address_end: 0,
+        });
+        let res = recover_reorder(&words, vec![10, 11], validation, |_| {});
+        assert!(res.mnemonic.is_some(), "should find the correct order");
+        let m = res.mnemonic.unwrap();
+        assert_eq!(m[10], "abandon");
+        assert_eq!(m[11], "about");
     }
 }

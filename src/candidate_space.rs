@@ -129,6 +129,34 @@ impl CandidateSpace for MissingTypoSpace {
     }
 }
 
+/// Wrong-order recovery: all words known, but the words at
+/// `permute_positions` might be in the wrong order among themselves. Every
+/// other position is fixed.
+pub struct ReorderSpace {
+    pub base_indices: Vec<u16>,
+    pub permute_positions: Vec<usize>,
+}
+
+impl CandidateSpace for ReorderSpace {
+    fn total(&self) -> u64 {
+        crate::lehmer::factorial(self.permute_positions.len() as u64)
+    }
+
+    fn candidate_at(&self, index: u64) -> Vec<u16> {
+        let subset: Vec<u16> = self
+            .permute_positions
+            .iter()
+            .map(|&p| self.base_indices[p])
+            .collect();
+        let permuted = crate::lehmer::nth_permutation(&subset, index);
+        let mut out = self.base_indices.clone();
+        for (i, &pos) in self.permute_positions.iter().enumerate() {
+            out[pos] = permuted[i];
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,5 +275,44 @@ mod tests {
         let missing_space_total = 2048u64.pow(space.missing_positions.len() as u32);
         let expected_unique = space.total() - missing_space_total * space.known_positions.len() as u64;
         assert_eq!(seen.len() as u64, expected_unique);
+    }
+
+    #[test]
+    fn reorder_space_total_is_factorial_of_subset_size() {
+        let space = ReorderSpace {
+            base_indices: vec![1u16, 2, 3, 4, 5],
+            permute_positions: vec![1, 2, 4],
+        };
+        assert_eq!(space.total(), 6); // 3!
+    }
+
+    #[test]
+    fn reorder_space_only_touches_marked_positions() {
+        let space = ReorderSpace {
+            base_indices: vec![10u16, 20, 30, 40],
+            permute_positions: vec![1, 3],
+        };
+        for i in 0..space.total() {
+            let c = space.candidate_at(i);
+            assert_eq!(c[0], 10);
+            assert_eq!(c[2], 30);
+            // positions 1 and 3 together always contain {20, 40}
+            let mut pair = vec![c[1], c[3]];
+            pair.sort();
+            assert_eq!(pair, vec![20, 40]);
+        }
+    }
+
+    #[test]
+    fn reorder_space_all_distinct() {
+        let space = ReorderSpace {
+            base_indices: vec![1u16, 2, 3, 4],
+            permute_positions: vec![0, 1, 2, 3],
+        };
+        let mut seen = HashSet::new();
+        for i in 0..space.total() {
+            assert!(seen.insert(space.candidate_at(i)));
+        }
+        assert_eq!(seen.len() as u64, 24); // 4!
     }
 }
