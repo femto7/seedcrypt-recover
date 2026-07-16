@@ -964,6 +964,14 @@ Add to `src/candidate_space.rs`, above the existing `#[cfg(test)]` block:
 /// `combined_index = missing_index * typo_choice_space + typo_choice_index`,
 /// where `typo_choice_space = 1 + known_positions.len() * 2048` (the `+1`
 /// is "no typo, known words exactly as given").
+///
+/// Note: like `TypoSpace`, this has a small amount of harmless redundancy —
+/// for each `missing_index`, exactly `known_positions.len()` of the
+/// `typo_choice_space` indices are self-referential (the chosen substitute
+/// word equals the word already at that position), which collide with the
+/// `typo_choice_index == 0` "no typo" baseline for the same `missing_index`.
+/// Traded deliberately for the same uniform, checkpoint-friendly indexing
+/// scheme as `TypoSpace`.
 pub struct MissingTypoSpace {
     pub known_indices: Vec<u16>,
     pub missing_positions: Vec<usize>,
@@ -1051,7 +1059,15 @@ Add to the `#[cfg(test)] mod tests` block in the same file:
     }
 
     #[test]
-    fn missing_typo_space_all_distinct_small() {
+    fn missing_typo_space_candidate_count_matches_documented_redundancy() {
+        // NOT a strict-bijection test — MissingTypoSpace has documented,
+        // intentional redundancy (see the struct's doc comment): for each
+        // missing_index, exactly known_positions.len() of the
+        // typo_choice_space indices are self-referential substitutions
+        // that collide with the typo_choice_index == 0 baseline. This test
+        // locks in the exact expected unique-candidate count given that
+        // redundancy, rather than asserting a distinctness property the
+        // design deliberately doesn't provide (same as TypoSpace).
         let space = MissingTypoSpace {
             known_indices: vec![3u16; 3],
             missing_positions: vec![1],
@@ -1059,9 +1075,11 @@ Add to the `#[cfg(test)] mod tests` block in the same file:
         };
         let mut seen = HashSet::new();
         for i in 0..space.total() {
-            assert!(seen.insert(space.candidate_at(i)));
+            seen.insert(space.candidate_at(i));
         }
-        assert_eq!(seen.len() as u64, space.total());
+        let missing_space_total = 2048u64.pow(space.missing_positions.len() as u32);
+        let expected_unique = space.total() - missing_space_total * space.known_positions.len() as u64;
+        assert_eq!(seen.len() as u64, expected_unique);
     }
 ```
 
