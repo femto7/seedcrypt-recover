@@ -31,9 +31,11 @@ Both modes use [`libsecp256k1`](https://github.com/bitcoin-core/secp256k1) (FFI'
 - ✅ HD derivation (BIP32) for BIP44, BIP49, BIP84, BIP86
 - ✅ Missing-word recovery (1–3 words at known positions)
 - ✅ Typo correction (1 word wrong, position unknown)
+- ✅ Combined missing + typo (`missing --allow-typo`)
+- ✅ Wrong-order recovery — `reorder`, up to 10 permuted positions
+- ✅ Checkpoint/resume — `--checkpoint`/`--resume`, survives crash/Ctrl+C/reboot
 - ✅ Address-based validation (early exit on match)
 - ✅ Multi-core parallel search via rayon
-- ⏳ Wrong-order recovery (permutations) — not yet
 - ⏳ Multi-language wordlists — English only
 
 ## Supported coins
@@ -92,6 +94,49 @@ seedcrypt-recover typo \
 (Synthetic example using the well-known **abandon-about** BIP39 test vector — a public test seed used by every wallet for unit testing. Word 11 is intentionally typo'd `abandun` instead of `abandon`. The tool finds the substitution in seconds.)
 
 > ⚠️ **Never share your real seed phrase or address pair publicly.** This README intentionally uses a public test vector with no funds. If you copy-paste a real example anywhere (issue, blog, support thread), assume the funds at that address are immediately drained.
+
+### Combined missing word + typo
+
+```bash
+seedcrypt-recover missing \
+  --mnemonic "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon apple ?" \
+  --address 0x9858EfFD232B4033E47d90003D41EC34EcaEda94 \
+  --allow-typo
+```
+
+Fills the `?` **and** tolerates one typo among the words you did type in — for
+when you're not sure a missing word is the *only* thing wrong.
+
+### Wrong order
+
+```bash
+seedcrypt-recover reorder \
+  --mnemonic "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about abandon" \
+  --permute-positions 11,12 \
+  --address 0x9858EfFD232B4033E47d90003D41EC34EcaEda94
+```
+
+All 12 words are correct, but you suspect positions 11 and 12 (1-indexed)
+got swapped. `--permute-positions` takes 2–10 positions — the tool tries
+every ordering of just those words, leaving the rest fixed. (12! full-seed
+permutations is infeasible; marking only the positions you actually suspect
+keeps the search tractable.)
+
+### Resuming a long search
+
+```bash
+# Start, checkpointing every ~100k candidates:
+seedcrypt-recover missing --mnemonic "... ? ? ?" --address 0x... \
+  --checkpoint progress.json
+
+# If it's interrupted (Ctrl+C, crash, reboot), continue with:
+seedcrypt-recover missing --mnemonic "... ? ? ?" --address 0x... \
+  --resume progress.json
+```
+
+`--resume` refuses to continue if the mnemonic pattern, address, passphrase,
+or derivation settings don't match what's in the checkpoint — it won't
+silently resume into the wrong search.
 
 ### With BIP39 passphrase
 

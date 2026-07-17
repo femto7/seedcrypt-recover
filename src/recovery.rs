@@ -1,18 +1,31 @@
 //! Recovery algorithms.
 //!
-//! - `recover_missing` — N missing words at known positions, with optional
-//!   address validation. Equivalent to btcrecover Phase 1 (1-3 missing words).
-//! - `recover_typo` — single typo somewhere in the seed; tries each position
-//!   × all 2048 substitutions. Equivalent to btcrecover Phase 2.
-//!
-//! Both use rayon for parallel iteration across CPU cores. First match wins.
+//! Every mode below builds a `CandidateSpace` and hands it to the shared
+//! `run_chunked_search` runner (`src/search.rs`), which is what makes
+//! checkpoint/resume (`src/checkpoint.rs`) work identically across modes.
 
 use crate::address::{derive_addresses, DerivationType};
 use crate::bip39::{mnemonic_to_seed, validate_checksum, word_index, words};
-use rayon::prelude::*;
+use crate::candidate_space::{MissingSpace, MissingTypoSpace, ReorderSpace, TypoSpace};
+use crate::search::run_chunked_search;
 use secp256k1::Secp256k1;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+
+/// Above this many total candidates, a combined missing+typo search is
+/// impractical (multi-hour-plus even with validation short-circuiting).
+/// Plain `missing` (no --allow-typo) keeps its own existing
+/// `missing_positions.len() > 3` guard, unchanged, for regression safety.
+///
+/// In practice this means `--allow-typo` is only useful with exactly 1
+/// missing word — for any seed length, 2+ missing words combined with a
+/// typo already exceeds this cap by ~2 orders of magnitude (e.g. a
+/// 12-word seed with 2 missing + typo has a minimum possible total of
+/// ~8.6×10^10, ~172x over 500M). This is intentional, not a bug — but it
+/// means the guard will silently reject before searching in that case,
+/// which the CLI layer (Task 7) needs to surface clearly rather than let
+/// it look identical to "searched and found nothing."
+const MAX_COMBINED_CANDIDATES: u64 = 500_000_000;
 
 /// Optional address-based filter. When set, the recovery short-circuits at
 /// the first checksum-valid candidate whose derived addresses contain the
@@ -49,6 +62,10 @@ pub struct RecoveryRequest {
     /// `None` for missing slots, `Some(word)` for known.
     pub words: Vec<Option<String>>,
     pub validation: Option<ValidationConfig>,
+    /// When `true`, `recover_missing`/`recover_missing_resumable` also
+    /// tries substituting one known word (in addition to filling `?`
+    /// slots). Ignored by `recover_typo`/`recover_typo_resumable`.
+    pub allow_typo: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -56,284 +73,317 @@ pub struct RecoveryResult {
     pub mnemonic: Option<Vec<String>>,
     pub combinations_tested: u64,
     pub elapsed_ms: u128,
+    /// `true` if the search was interrupted (Ctrl+C) before completion or
+    /// a match. When `true`, `mnemonic` is `None` and the caller should
+    /// have already been given a checkpoint to resume from.
+    pub interrupted: bool,
 }
 
-/// Recover missing words at known positions. Supports up to 3 missing words
-/// efficiently (4M combinations checksum-only). With validation, even higher
-/// counts work but get progressively slower.
-pub fn recover_missing(
-    req: &RecoveryRequest,
-    progress: impl Fn(u64) + Sync + Send,
-) -> RecoveryResult {
-    let start = std::time::Instant::now();
-
+/// Resolves `req.words` into (known_indices with 0 placeholders at missing
+/// slots, missing_positions, known_positions). Returns `None` if any known
+/// word isn't a valid BIP39 word.
+fn resolve_words(req: &RecoveryRequest) -> Option<(Vec<u16>, Vec<usize>, Vec<usize>)> {
     let map = word_index();
-    let wordlist_static = words();
     let mut known_indices = vec![0u16; req.seed_length];
     let mut missing_positions = Vec::new();
+    let mut known_positions = Vec::new();
     for (i, w) in req.words.iter().enumerate() {
         match w {
             None => missing_positions.push(i),
             Some(w) => match map.get(w.as_str()) {
-                Some(&idx) => known_indices[i] = idx,
-                None => {
-                    return RecoveryResult {
-                        mnemonic: None,
-                        combinations_tested: 0,
-                        elapsed_ms: start.elapsed().as_millis(),
-                    };
+                Some(&idx) => {
+                    known_indices[i] = idx;
+                    known_positions.push(i);
                 }
+                None => return None,
             },
         }
     }
-    let m = missing_positions.len();
+    Some((known_indices, missing_positions, known_positions))
+}
 
-    let found = AtomicBool::new(false);
-    let result_lock: Mutex<Option<Vec<String>>> = Mutex::new(None);
-    let total_tested = std::sync::atomic::AtomicU64::new(0);
+/// Like `resolve_words`, but for `typo` mode specifically: tolerates up to
+/// one word that isn't a valid BIP39 word (the presumed typo), assigning it
+/// a placeholder index instead of failing resolution outright. `TypoSpace`'s
+/// search sweeps every position 0..N trying all 2048 real words at each —
+/// candidates where the swept position lands elsewhere still carry the
+/// placeholder at the misspelled slot, which is *usually* wasted work (it
+/// fails checksum) but not guaranteed to be: roughly 1/16 of candidates at
+/// any fixed position pass a 12-word mnemonic's 4-bit checksum by chance.
+/// This isn't specific to the placeholder value — it's inherent to
+/// `TypoSpace`'s search in general, checksum-only or not (see
+/// `recover_typo`'s doc comment for the mitigation: pass `validation`).
+/// Returns `None` if 2+ words are unresolvable: this mode only searches for
+/// exactly one wrong word, and no single position-sweep can correct two
+/// simultaneously.
+fn resolve_words_for_typo(words: &[Option<String>]) -> Option<Vec<u16>> {
+    let map = word_index();
+    let mut base_indices = vec![0u16; words.len()];
+    let mut unresolved_count = 0usize;
+    for (i, w) in words.iter().enumerate() {
+        match w {
+            None => unresolved_count += 1,
+            Some(w) => match map.get(w.as_str()) {
+                Some(&idx) => base_indices[i] = idx,
+                None => unresolved_count += 1,
+            },
+        }
+    }
+    if unresolved_count > 1 {
+        return None;
+    }
+    Some(base_indices)
+}
 
-    let validation = req.validation.clone();
-    let secp = Secp256k1::new();
-
-    let try_candidate = |indices: &[u16]| -> bool {
+/// Builds the shared per-candidate test closure: checksum-validate, then
+/// (if a `ValidationConfig` is set) derive addresses and compare. On match,
+/// records the mnemonic and flips `found`.
+fn make_try_candidate<'a>(
+    validation: &'a Option<ValidationConfig>,
+    secp: &'a Secp256k1<secp256k1::All>,
+    found: &'a AtomicBool,
+    result_lock: &'a Mutex<Option<Vec<String>>>,
+) -> impl Fn(&[u16]) -> bool + Sync + 'a {
+    let wordlist = words();
+    move |indices: &[u16]| -> bool {
         if !validate_checksum(indices) {
             return false;
         }
-        let mnemonic_owned: Vec<String> = indices
-            .iter()
-            .map(|&i| wordlist_static[i as usize].to_string())
-            .collect();
-        let mnemonic_refs: Vec<&str> =
-            mnemonic_owned.iter().map(|s| s.as_str()).collect();
-        if let Some(v) = &validation {
-            let seed = mnemonic_to_seed(&mnemonic_refs, &v.passphrase);
-            let addresses = derive_addresses(
-                &secp,
-                &seed,
-                v.kind,
-                v.account_start,
-                v.account_end,
-                v.address_start,
-                v.address_end,
-            );
-            let target = v.address.to_ascii_lowercase();
-            if addresses.iter().any(|a| a.to_ascii_lowercase() == target) {
+        let mnemonic_owned: Vec<String> =
+            indices.iter().map(|&i| wordlist[i as usize].to_string()).collect();
+        let mnemonic_refs: Vec<&str> = mnemonic_owned.iter().map(|s| s.as_str()).collect();
+        match validation {
+            Some(v) => {
+                let seed = mnemonic_to_seed(&mnemonic_refs, &v.passphrase);
+                let addresses = derive_addresses(
+                    secp,
+                    &seed,
+                    v.kind,
+                    v.account_start,
+                    v.account_end,
+                    v.address_start,
+                    v.address_end,
+                );
+                let target = v.address.to_ascii_lowercase();
+                if addresses.iter().any(|a| a.to_ascii_lowercase() == target) {
+                    let mut g = result_lock.lock().unwrap();
+                    if g.is_none() {
+                        *g = Some(mnemonic_owned);
+                    }
+                    found.store(true, Ordering::Relaxed);
+                    return true;
+                }
+                false
+            }
+            None => {
                 let mut g = result_lock.lock().unwrap();
                 if g.is_none() {
                     *g = Some(mnemonic_owned);
                 }
                 found.store(true, Ordering::Relaxed);
-                return true;
+                true
             }
-            false
-        } else {
-            // No validation — accept first checksum-valid candidate.
-            let mut g = result_lock.lock().unwrap();
-            if g.is_none() {
-                *g = Some(mnemonic_owned);
-            }
-            found.store(true, Ordering::Relaxed);
-            true
         }
-    };
-
-    // Parallelism strategy: split the OUTER missing-position loop across
-    // cores via rayon's par_bridge.
-    match m {
-        0 => {
-            // No missing positions — just test the seed as-is.
-            try_candidate(&known_indices);
-            total_tested.fetch_add(1, Ordering::Relaxed);
-        }
-        1 => {
-            (0u16..2048).into_par_iter().for_each(|w0| {
-                if found.load(Ordering::Relaxed) {
-                    return;
-                }
-                let mut idx = known_indices.clone();
-                idx[missing_positions[0]] = w0;
-                try_candidate(&idx);
-                let prev = total_tested.fetch_add(1, Ordering::Relaxed);
-                if prev % 4096 == 0 {
-                    progress(prev + 1);
-                }
-            });
-        }
-        2 => {
-            (0u16..2048).into_par_iter().for_each(|w0| {
-                if found.load(Ordering::Relaxed) {
-                    return;
-                }
-                let mut idx = known_indices.clone();
-                idx[missing_positions[0]] = w0;
-                for w1 in 0u16..2048 {
-                    if found.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    idx[missing_positions[1]] = w1;
-                    try_candidate(&idx);
-                    let prev = total_tested.fetch_add(1, Ordering::Relaxed);
-                    if prev % 4096 == 0 {
-                        progress(prev + 1);
-                    }
-                }
-            });
-        }
-        3 => {
-            (0u16..2048).into_par_iter().for_each(|w0| {
-                if found.load(Ordering::Relaxed) {
-                    return;
-                }
-                let mut idx = known_indices.clone();
-                idx[missing_positions[0]] = w0;
-                for w1 in 0u16..2048 {
-                    if found.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    idx[missing_positions[1]] = w1;
-                    for w2 in 0u16..2048 {
-                        if found.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        idx[missing_positions[2]] = w2;
-                        try_candidate(&idx);
-                        let prev = total_tested.fetch_add(1, Ordering::Relaxed);
-                        if prev % 4096 == 0 {
-                            progress(prev + 1);
-                        }
-                    }
-                }
-            });
-        }
-        _ => {
-            // 4+ missing — astronomical. Skip.
-        }
-    }
-
-    let mnemonic = result_lock.lock().unwrap().take();
-    RecoveryResult {
-        mnemonic,
-        combinations_tested: total_tested.load(Ordering::Relaxed),
-        elapsed_ms: start.elapsed().as_millis(),
     }
 }
 
-/// Try replacing each position with all 2048 BIP39 words.
-/// Total candidates = N × 2048 — fast (~25k for 12 words).
+/// Recover missing words at known positions (1-3 missing, checksum-only or
+/// address-validated). `resume_index` is 0 for a fresh search.
+pub fn recover_missing(
+    req: &RecoveryRequest,
+    progress: impl Fn(u64) + Sync + Send,
+) -> RecoveryResult {
+    recover_missing_resumable(req, 0, &AtomicBool::new(false), progress, |_| {})
+}
+
+/// Same as `recover_missing`, plus resume support. `stop` is checked
+/// between chunks (e.g. wired to a Ctrl+C handler by the caller);
+/// `on_chunk_complete` is called with the new watermark after each
+/// completed chunk (e.g. to write a checkpoint).
+pub fn recover_missing_resumable(
+    req: &RecoveryRequest,
+    resume_index: u64,
+    stop: &AtomicBool,
+    progress: impl Fn(u64) + Sync + Send,
+    on_chunk_complete: impl FnMut(u64),
+) -> RecoveryResult {
+    let start = std::time::Instant::now();
+    let Some((known_indices, missing_positions, known_positions)) = resolve_words(req) else {
+        return RecoveryResult { mnemonic: None, combinations_tested: 0, elapsed_ms: start.elapsed().as_millis(), interrupted: false };
+    };
+    if missing_positions.is_empty() || missing_positions.len() > 3 {
+        return RecoveryResult { mnemonic: None, combinations_tested: 0, elapsed_ms: start.elapsed().as_millis(), interrupted: false };
+    }
+
+    let combined_total = if req.allow_typo {
+        let typo_choice_space = 1 + known_positions.len() as u64 * 2048;
+        let missing_total = 2048u64.pow(missing_positions.len() as u32);
+        Some(missing_total * typo_choice_space)
+    } else {
+        None
+    };
+    if let Some(total) = combined_total {
+        if total > MAX_COMBINED_CANDIDATES {
+            return RecoveryResult {
+                mnemonic: None,
+                combinations_tested: 0,
+                elapsed_ms: start.elapsed().as_millis(),
+                interrupted: false,
+            };
+        }
+    }
+
+    let found = AtomicBool::new(false);
+    let result_lock: Mutex<Option<Vec<String>>> = Mutex::new(None);
+    let secp = Secp256k1::new();
+    let try_candidate = make_try_candidate(&req.validation, &secp, &found, &result_lock);
+
+    let outcome = if req.allow_typo {
+        let space = MissingTypoSpace { known_indices, missing_positions, known_positions };
+        run_chunked_search(&space, resume_index, &found, stop, try_candidate, on_chunk_complete, progress)
+    } else {
+        let space = MissingSpace { known_indices, missing_positions };
+        run_chunked_search(&space, resume_index, &found, stop, try_candidate, on_chunk_complete, progress)
+    };
+
+    // Bound to a local before returning: rustc's borrowck cannot prove the
+    // MutexGuard temporary from `.lock().unwrap()` is safe to drop when
+    // this struct literal is the function's tail expression (E0597,
+    // "temporary is part of an expression at the end of a block") — even
+    // though `.take()` returns a fully owned value with no borrow. Binding
+    // to `result` first forces the guard to drop within this `let`
+    // statement, before `result_lock` itself is dropped at function end.
+    let result = RecoveryResult {
+        mnemonic: result_lock.lock().unwrap().take(),
+        combinations_tested: outcome.tested,
+        elapsed_ms: start.elapsed().as_millis(),
+        interrupted: outcome.interrupted,
+    };
+    result
+}
+
+/// Try replacing each position with all 2048 BIP39 words (single typo).
+///
+/// Address validation (`req.validation`) is strongly recommended for this
+/// mode specifically: a 12-word mnemonic's checksum is only 4 bits, so
+/// roughly 1 in 16 wrong-word substitutions at a given position pass it by
+/// chance — checksum-only (`validation: None`) typo search has a real,
+/// non-negligible chance of confidently returning an incorrect "match"
+/// rather than the true correction. This is a property of the search space
+/// itself, not a bug — the CLI's `typo` subcommand always requires
+/// `--address` for exactly this reason; direct library/FFI callers should
+/// do the same wherever possible.
 pub fn recover_typo(
     req: &RecoveryRequest,
     progress: impl Fn(u64) + Sync + Send,
 ) -> RecoveryResult {
+    recover_typo_resumable(req, 0, &AtomicBool::new(false), progress, |_| {})
+}
+
+/// Same as `recover_typo`, plus resume support (see `recover_missing_resumable`).
+pub fn recover_typo_resumable(
+    req: &RecoveryRequest,
+    resume_index: u64,
+    stop: &AtomicBool,
+    progress: impl Fn(u64) + Sync + Send,
+    on_chunk_complete: impl FnMut(u64),
+) -> RecoveryResult {
     let start = std::time::Instant::now();
-
-    let map = word_index();
-    let wordlist_static = words();
-    let mut base_indices = vec![0u16; req.seed_length];
-    for (i, w) in req.words.iter().enumerate() {
-        if let Some(w) = w {
-            match map.get(w.as_str()) {
-                Some(&idx) => base_indices[i] = idx,
-                None => {
-                    return RecoveryResult {
-                        mnemonic: None,
-                        combinations_tested: 0,
-                        elapsed_ms: start.elapsed().as_millis(),
-                    };
-                }
-            }
-        }
-    }
-
-    let found = AtomicBool::new(false);
-    let result_lock: Mutex<Option<Vec<String>>> = Mutex::new(None);
-    let total_tested = std::sync::atomic::AtomicU64::new(0);
-
-    let validation = req.validation.clone();
-    let secp = Secp256k1::new();
-
-    let try_candidate = |indices: &[u16]| -> bool {
-        if !validate_checksum(indices) {
-            return false;
-        }
-        let mnemonic_owned: Vec<String> = indices
-            .iter()
-            .map(|&i| wordlist_static[i as usize].to_string())
-            .collect();
-        let mnemonic_refs: Vec<&str> =
-            mnemonic_owned.iter().map(|s| s.as_str()).collect();
-        if let Some(v) = &validation {
-            let seed = mnemonic_to_seed(&mnemonic_refs, &v.passphrase);
-            let addresses = derive_addresses(
-                &secp,
-                &seed,
-                v.kind,
-                v.account_start,
-                v.account_end,
-                v.address_start,
-                v.address_end,
-            );
-            let target = v.address.to_ascii_lowercase();
-            if addresses.iter().any(|a| a.to_ascii_lowercase() == target) {
-                let mut g = result_lock.lock().unwrap();
-                if g.is_none() {
-                    *g = Some(mnemonic_owned);
-                }
-                found.store(true, Ordering::Relaxed);
-                return true;
-            }
-            false
-        } else {
-            let mut g = result_lock.lock().unwrap();
-            if g.is_none() {
-                *g = Some(mnemonic_owned);
-            }
-            found.store(true, Ordering::Relaxed);
-            true
-        }
+    let Some(base_indices) = resolve_words_for_typo(&req.words) else {
+        return RecoveryResult { mnemonic: None, combinations_tested: 0, elapsed_ms: start.elapsed().as_millis(), interrupted: false };
     };
 
-    let n = req.seed_length;
-    (0..n).into_par_iter().for_each(|pos| {
-        if found.load(Ordering::Relaxed) {
-            return;
-        }
-        let mut idx = base_indices.clone();
-        let original = base_indices[pos];
-        for w in 0u16..2048 {
-            if found.load(Ordering::Relaxed) {
-                break;
-            }
-            // Skip the original — but DO test it once when pos=0 to handle
-            // the "no typo" case.
-            if w == original && pos != 0 {
-                continue;
-            }
-            idx[pos] = w;
-            try_candidate(&idx);
-            let prev = total_tested.fetch_add(1, Ordering::Relaxed);
-            if prev % 1024 == 0 {
-                progress(prev + 1);
-            }
-        }
-    });
+    let space = TypoSpace { base_indices };
+    let found = AtomicBool::new(false);
+    let result_lock: Mutex<Option<Vec<String>>> = Mutex::new(None);
+    let secp = Secp256k1::new();
+    let try_candidate = make_try_candidate(&req.validation, &secp, &found, &result_lock);
 
-    let mnemonic = result_lock.lock().unwrap().take();
-    RecoveryResult {
-        mnemonic,
-        combinations_tested: total_tested.load(Ordering::Relaxed),
+    let outcome = run_chunked_search(&space, resume_index, &found, stop, try_candidate, on_chunk_complete, progress);
+
+    // Bound to a local before returning: rustc's borrowck cannot prove the
+    // MutexGuard temporary from `.lock().unwrap()` is safe to drop when
+    // this struct literal is the function's tail expression (E0597,
+    // "temporary is part of an expression at the end of a block") — even
+    // though `.take()` returns a fully owned value with no borrow. Binding
+    // to `result` first forces the guard to drop within this `let`
+    // statement, before `result_lock` itself is dropped at function end.
+    let result = RecoveryResult {
+        mnemonic: result_lock.lock().unwrap().take(),
+        combinations_tested: outcome.tested,
         elapsed_ms: start.elapsed().as_millis(),
+        interrupted: outcome.interrupted,
+    };
+    result
+}
+
+/// Wrong-order recovery: `permute_positions` (0-indexed) marks the
+/// positions whose words might be in the wrong order among themselves.
+/// Guarded to `2..=10` positions by the caller (CLI layer) — 10! ≈ 3.6M is
+/// the practical ceiling for this mode.
+pub fn recover_reorder(
+    words: &[String],
+    permute_positions: Vec<usize>,
+    validation: Option<ValidationConfig>,
+    progress: impl Fn(u64) + Sync + Send,
+) -> RecoveryResult {
+    recover_reorder_resumable(words, permute_positions, validation, 0, &AtomicBool::new(false), progress, |_| {})
+}
+
+/// Same as `recover_reorder`, plus resume support.
+pub fn recover_reorder_resumable(
+    words: &[String],
+    permute_positions: Vec<usize>,
+    validation: Option<ValidationConfig>,
+    resume_index: u64,
+    stop: &AtomicBool,
+    progress: impl Fn(u64) + Sync + Send,
+    on_chunk_complete: impl FnMut(u64),
+) -> RecoveryResult {
+    let start = std::time::Instant::now();
+    let map = word_index();
+    let mut base_indices = Vec::with_capacity(words.len());
+    for w in words {
+        match map.get(w.as_str()) {
+            Some(&idx) => base_indices.push(idx),
+            None => {
+                return RecoveryResult { mnemonic: None, combinations_tested: 0, elapsed_ms: start.elapsed().as_millis(), interrupted: false };
+            }
+        }
     }
+
+    let space = ReorderSpace { base_indices, permute_positions };
+    let found = AtomicBool::new(false);
+    let result_lock: Mutex<Option<Vec<String>>> = Mutex::new(None);
+    let secp = Secp256k1::new();
+    let try_candidate = make_try_candidate(&validation, &secp, &found, &result_lock);
+
+    let outcome = run_chunked_search(&space, resume_index, &found, stop, try_candidate, on_chunk_complete, progress);
+
+    // Bound to a local before returning: rustc's borrowck cannot prove the
+    // MutexGuard temporary from `.lock().unwrap()` is safe to drop when
+    // this struct literal is the function's tail expression (E0597,
+    // "temporary is part of an expression at the end of a block") — even
+    // though `.take()` returns a fully owned value with no borrow. Binding
+    // to `result` first forces the guard to drop within this `let`
+    // statement, before `result_lock` itself is dropped at function end.
+    let result = RecoveryResult {
+        mnemonic: result_lock.lock().unwrap().take(),
+        combinations_tested: outcome.tested,
+        elapsed_ms: start.elapsed().as_millis(),
+        interrupted: outcome.interrupted,
+    };
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::address::DerivationType;
 
     #[test]
     fn recover_missing_one_word_with_address() {
-        // abandon × 11 + ? where target is the abandon-about ETH address
-        let mut words: Vec<Option<String>> =
-            vec![Some("abandon".to_string()); 11];
+        let mut words: Vec<Option<String>> = vec![Some("abandon".to_string()); 11];
         words.push(None);
         let req = RecoveryRequest {
             seed_length: 12,
@@ -347,31 +397,45 @@ mod tests {
                 address_start: 0,
                 address_end: 0,
             }),
+            allow_typo: false,
         };
         let res = recover_missing(&req, |_| {});
         assert!(res.mnemonic.is_some(), "should find a match");
         assert_eq!(res.mnemonic.as_ref().unwrap().last().unwrap(), "about");
+        assert!(!res.interrupted);
+    }
+
+    #[test]
+    fn recover_missing_two_words_still_works_after_refactor() {
+        let mut words: Vec<Option<String>> = vec![Some("abandon".to_string()); 10];
+        words.push(None);
+        words.push(None);
+        let req = RecoveryRequest {
+            seed_length: 12,
+            words,
+            validation: Some(ValidationConfig {
+                address: "0x9858EfFD232B4033E47d90003D41EC34EcaEda94".into(),
+                kind: DerivationType::EthereumStandard,
+                passphrase: String::new(),
+                account_start: 0,
+                account_end: 0,
+                address_start: 0,
+                address_end: 0,
+            }),
+            allow_typo: false,
+        };
+        let res = recover_missing(&req, |_| {});
+        assert!(res.mnemonic.is_some());
+        assert_eq!(res.mnemonic.as_ref().unwrap()[10], "abandon");
+        assert_eq!(res.mnemonic.as_ref().unwrap()[11], "about");
     }
 
     #[test]
     fn recover_typo_canonical_vector() {
-        // Synthetic test using the well-known abandon-about BIP39 test vector.
-        // The real seed is `abandon` × 11 + `about`. We swap word 11 (index
-        // 10) from `abandon` to `apple` — both are valid BIP39 words, but
-        // `apple` is wrong for this address. The typo correction should
-        // restore `abandon` at position 10.
-        // No real funds — this is a public test vector embedded in every
-        // BIP39 implementation and shared across the ecosystem.
         let words = vec![
-            Some("abandon".into()),
-            Some("abandon".into()),
-            Some("abandon".into()),
-            Some("abandon".into()),
-            Some("abandon".into()),
-            Some("abandon".into()),
-            Some("abandon".into()),
-            Some("abandon".into()),
-            Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
             Some("abandon".into()),
             Some("apple".into()), // ← wrong word (valid BIP39, not in this seed)
             Some("about".into()),
@@ -388,9 +452,247 @@ mod tests {
                 address_start: 0,
                 address_end: 0,
             }),
+            allow_typo: false,
         };
         let res = recover_typo(&req, |_| {});
         assert!(res.mnemonic.is_some(), "should find the typo correction");
         assert_eq!(res.mnemonic.as_ref().unwrap()[10], "abandon");
+        assert!(!res.interrupted);
+    }
+
+    #[test]
+    fn recover_typo_finds_out_of_wordlist_misspelling() {
+        // Real seed: abandon×11 + about. Position 11 (0-indexed 10) is given
+        // as "abandun" — a genuine misspelling, NOT a valid BIP39 word (unlike
+        // recover_typo_canonical_vector's "apple", which IS a valid word, just
+        // the wrong one). This is the exact scenario the README's typo example
+        // demonstrates and the original bug this test guards against.
+        let words = vec![
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()),
+            Some("abandun".into()), // ← genuine misspelling, not in the wordlist
+            Some("about".into()),
+        ];
+        let req = RecoveryRequest {
+            seed_length: 12,
+            words,
+            validation: Some(ValidationConfig {
+                address: "0x9858EfFD232B4033E47d90003D41EC34EcaEda94".into(),
+                kind: DerivationType::EthereumStandard,
+                passphrase: String::new(),
+                account_start: 0,
+                account_end: 0,
+                address_start: 0,
+                address_end: 0,
+            }),
+            allow_typo: false,
+        };
+        let res = recover_typo(&req, |_| {});
+        assert!(res.mnemonic.is_some(), "should find the correction for a genuine misspelling, not just a valid-word substitution");
+        let m = res.mnemonic.unwrap();
+        assert_eq!(m[10], "abandon");
+    }
+
+    #[test]
+    fn recover_typo_rejects_two_unresolvable_words() {
+        // Two genuinely misspelled words — out of scope for "one word wrong"
+        // search (no single position-sweep can fix both simultaneously).
+        // Must fail cleanly (0 candidates), not panic or search forever.
+        let words = vec![
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandun".into()), // typo #1, not a real word
+            Some("abandun".into()), // typo #2, not a real word
+            Some("about".into()),
+        ];
+        let req = RecoveryRequest {
+            seed_length: 12,
+            words,
+            validation: None,
+            allow_typo: false,
+        };
+        let res = recover_typo(&req, |_| {});
+        assert!(res.mnemonic.is_none());
+        assert_eq!(res.combinations_tested, 0);
+    }
+
+    #[test]
+    fn recover_typo_finds_misspelling_at_first_position() {
+        // Same canonical seed (abandon×11 + about), but the FIRST word (not
+        // a middle one) is misspelled — regression coverage for the
+        // position-0 edge of TypoSpace's sweep.
+        let words = vec![
+            Some("abandom".into()), // ← genuine misspelling at position 0
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()),
+            Some("about".into()),
+        ];
+        let req = RecoveryRequest {
+            seed_length: 12,
+            words,
+            validation: Some(ValidationConfig {
+                address: "0x9858EfFD232B4033E47d90003D41EC34EcaEda94".into(),
+                kind: DerivationType::EthereumStandard,
+                passphrase: String::new(),
+                account_start: 0,
+                account_end: 0,
+                address_start: 0,
+                address_end: 0,
+            }),
+            allow_typo: false,
+        };
+        let res = recover_typo(&req, |_| {});
+        assert!(res.mnemonic.is_some(), "should find the correction when the misspelling is at position 0");
+        let m = res.mnemonic.unwrap();
+        assert_eq!(m[0], "abandon");
+    }
+
+    #[test]
+    fn recover_typo_finds_misspelling_at_last_position() {
+        // Same canonical seed, but the LAST word is misspelled instead of a
+        // middle one — regression coverage for the position-(N-1) edge of
+        // TypoSpace's sweep.
+        let words = vec![
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()),
+            Some("abaut".into()), // ← genuine misspelling at the last position
+        ];
+        let req = RecoveryRequest {
+            seed_length: 12,
+            words,
+            validation: Some(ValidationConfig {
+                address: "0x9858EfFD232B4033E47d90003D41EC34EcaEda94".into(),
+                kind: DerivationType::EthereumStandard,
+                passphrase: String::new(),
+                account_start: 0,
+                account_end: 0,
+                address_start: 0,
+                address_end: 0,
+            }),
+            allow_typo: false,
+        };
+        let res = recover_typo(&req, |_| {});
+        assert!(res.mnemonic.is_some(), "should find the correction when the misspelling is at the last position");
+        let m = res.mnemonic.unwrap();
+        assert_eq!(m[11], "about");
+    }
+
+    #[test]
+    fn recover_missing_checksum_only_no_validation() {
+        // No address validation — accepts the first checksum-valid fill.
+        let mut words: Vec<Option<String>> = vec![Some("abandon".to_string()); 11];
+        words.push(None);
+        let req = RecoveryRequest {
+            seed_length: 12,
+            words,
+            validation: None,
+            allow_typo: false,
+        };
+        let res = recover_missing(&req, |_| {});
+        assert!(res.mnemonic.is_some(), "should find a checksum-valid fill");
+        assert!(!res.interrupted);
+    }
+
+    #[test]
+    fn recover_missing_rejects_too_many_missing_words() {
+        let mut words: Vec<Option<String>> = vec![Some("abandon".to_string()); 8];
+        words.extend(vec![None; 4]); // 4 missing — over the limit
+        let req = RecoveryRequest {
+            seed_length: 12,
+            words,
+            validation: None,
+            allow_typo: false,
+        };
+        let res = recover_missing(&req, |_| {});
+        assert!(res.mnemonic.is_none());
+        assert_eq!(res.combinations_tested, 0);
+    }
+
+    #[test]
+    fn recover_missing_allow_typo_finds_combined_error() {
+        // 1 missing word (position 11, the "?") AND a typo at position 10
+        // ("apple" instead of "abandon") in the same search.
+        let mut words: Vec<Option<String>> = vec![Some("abandon".to_string()); 10];
+        words.push(Some("apple".to_string())); // typo
+        words.push(None); // missing
+        let req = RecoveryRequest {
+            seed_length: 12,
+            words,
+            validation: Some(ValidationConfig {
+                address: "0x9858EfFD232B4033E47d90003D41EC34EcaEda94".into(),
+                kind: DerivationType::EthereumStandard,
+                passphrase: String::new(),
+                account_start: 0,
+                account_end: 0,
+                address_start: 0,
+                address_end: 0,
+            }),
+            allow_typo: true,
+        };
+        let res = recover_missing(&req, |_| {});
+        assert!(res.mnemonic.is_some(), "should find the combined match");
+        assert_eq!(res.mnemonic.as_ref().unwrap()[10], "abandon");
+        assert_eq!(res.mnemonic.as_ref().unwrap()[11], "about");
+    }
+
+    #[test]
+    fn recover_missing_without_allow_typo_ignores_typo_positions() {
+        // Same broken input as above, but allow_typo: false — the search
+        // space doesn't cover fixing the typo, so it must NOT find a match
+        // (regression: allow_typo: false must behave exactly as before).
+        let mut words: Vec<Option<String>> = vec![Some("abandon".to_string()); 10];
+        words.push(Some("apple".to_string()));
+        words.push(None);
+        let req = RecoveryRequest {
+            seed_length: 12,
+            words,
+            validation: Some(ValidationConfig {
+                address: "0x9858EfFD232B4033E47d90003D41EC34EcaEda94".into(),
+                kind: DerivationType::EthereumStandard,
+                passphrase: String::new(),
+                account_start: 0,
+                account_end: 0,
+                address_start: 0,
+                address_end: 0,
+            }),
+            allow_typo: false,
+        };
+        let res = recover_missing(&req, |_| {});
+        assert!(res.mnemonic.is_none(), "typo-only-fixable case must not match without --allow-typo");
+    }
+
+    #[test]
+    fn recover_reorder_swaps_two_words_back() {
+        // Real seed: abandon×11 + about. Swap positions 10 and 11 (0-indexed)
+        // so the mnemonic is given as abandon×10 + about + abandon — wrong
+        // order, all words individually valid BIP39 words.
+        let words: Vec<String> = vec![
+            "abandon".into(), "abandon".into(), "abandon".into(), "abandon".into(),
+            "abandon".into(), "abandon".into(), "abandon".into(), "abandon".into(),
+            "abandon".into(), "abandon".into(),
+            "about".into(),   // ← swapped
+            "abandon".into(), // ← swapped
+        ];
+        let validation = Some(ValidationConfig {
+            address: "0x9858EfFD232B4033E47d90003D41EC34EcaEda94".into(),
+            kind: DerivationType::EthereumStandard,
+            passphrase: String::new(),
+            account_start: 0,
+            account_end: 0,
+            address_start: 0,
+            address_end: 0,
+        });
+        let res = recover_reorder(&words, vec![10, 11], validation, |_| {});
+        assert!(res.mnemonic.is_some(), "should find the correct order");
+        let m = res.mnemonic.unwrap();
+        assert_eq!(m[10], "abandon");
+        assert_eq!(m[11], "about");
     }
 }
