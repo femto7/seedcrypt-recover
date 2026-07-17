@@ -1914,6 +1914,13 @@ pub struct Checkpoint {
     pub account_end: u32,
     pub address_start: u32,
     pub address_end: u32,
+    /// Whether `missing --allow-typo` was set. Part of the resume
+    /// signature because it selects a structurally different candidate
+    /// space (`MissingSpace` vs `MissingTypoSpace`, with a different
+    /// `total()`) — resuming with a flipped value would silently apply a
+    /// stale index to the wrong space instead of erroring. Always `false`
+    /// for `typo`/`reorder` mode, which don't have this flag.
+    pub allow_typo: bool,
     pub resume_index: u64,
     pub total_candidates: u64,
     pub elapsed_ms_so_far: u128,
@@ -1949,6 +1956,7 @@ impl Checkpoint {
             && self.account_end == other.account_end
             && self.address_start == other.address_start
             && self.address_end == other.address_end
+            && self.allow_typo == other.allow_typo
     }
 
     /// Atomic write: write to a `.tmp` sibling then rename over the target,
@@ -1998,6 +2006,7 @@ mod tests {
             account_end: 0,
             address_start: 0,
             address_end: 9,
+            allow_typo: false,
             resume_index,
             total_candidates: 2048,
             elapsed_ms_so_far: 1234,
@@ -2141,12 +2150,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 Add this helper function (after `make_progress_bar`, before `run_missing`):
 
 ```rust
-/// Resolves the starting index for a search: 0 for a fresh run, or the
-/// saved index from `--resume`'s checkpoint after verifying its signature
-/// matches the *expected* signature for this invocation. Errors out (does
-/// not silently guess) on any mismatch or unreadable/corrupt file.
-fn resolve_resume_index(resume_path: Option<&str>, expected: &Checkpoint) -> Result<u64> {
-    let Some(path) = resume_path else { return Ok(0) };
+/// Resolves the starting index and previously-accumulated elapsed time for
+/// a search: `(0, 0)` for a fresh run, or `(loaded.resume_index,
+/// loaded.elapsed_ms_so_far)` from `--resume`'s checkpoint after verifying
+/// its signature matches the *expected* signature for this invocation.
+/// Returning the prior elapsed time (not just the index) lets the caller
+/// accumulate it across resumes instead of restarting the clock at 0 each
+/// time. Errors out (does not silently guess) on any mismatch or
+/// unreadable/corrupt file.
+fn resolve_resume_index(resume_path: Option<&str>, expected: &Checkpoint) -> Result<(u64, u128)> {
+    let Some(path) = resume_path else { return Ok((0, 0)) };
     let loaded = Checkpoint::load(&PathBuf::from(path))?;
     if !loaded.matches_signature(expected) {
         return Err(anyhow!(
@@ -2160,12 +2173,17 @@ fn resolve_resume_index(resume_path: Option<&str>, expected: &Checkpoint) -> Res
         loaded.total_candidates,
         loaded.elapsed_ms_so_far as f64 / 1000.0,
     );
-    Ok(loaded.resume_index)
+    Ok((loaded.resume_index, loaded.elapsed_ms_so_far))
 }
 
 /// Installs a Ctrl+C handler that flips the returned `Arc<AtomicBool>` on
 /// the first SIGINT. Safe to call once per process (subsequent Ctrl+C
-/// presses during an in-flight write are a no-op past the first).
+/// presses during an in-flight write are a no-op past the first). Always
+/// installed, even when no `--checkpoint`/`--resume` was given — this lets
+/// an interrupted un-checkpointed run still report how many candidates it
+/// tested (see the `run_*` functions' `result.interrupted` handling) rather
+/// than dying with no summary at all under the OS's default SIGINT
+/// behavior.
 fn install_stop_flag() -> Arc<AtomicBool> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
@@ -2179,19 +2197,25 @@ fn install_stop_flag() -> Arc<AtomicBool> {
 }
 
 /// Writes (or overwrites) the checkpoint at `path` with the given progress.
+/// `base_elapsed_ms` is the elapsed time already accumulated by prior runs
+/// (0 for a fresh search, or `resolve_resume_index`'s returned elapsed time
+/// when resuming) — added to this run's own elapsed time so
+/// `elapsed_ms_so_far` accumulates across multiple resumes instead of
+/// resetting to just the current segment each time.
 /// Logs a warning instead of failing the whole search if the write fails
 /// (e.g. disk full, permissions) — losing a checkpoint write is much less
 /// bad than losing the whole search to a hard error mid-run.
 fn checkpoint_writer(
     path: Option<String>,
     base: Checkpoint,
+    base_elapsed_ms: u128,
     start: std::time::Instant,
 ) -> impl FnMut(u64) {
     move |resume_index: u64| {
         let Some(path) = &path else { return };
         let mut cp = base.clone();
         cp.resume_index = resume_index;
-        cp.elapsed_ms_so_far = start.elapsed().as_millis();
+        cp.elapsed_ms_so_far = base_elapsed_ms + start.elapsed().as_millis();
         if let Err(e) = cp.save(&PathBuf::from(path)) {
             eprintln!("{} Could not write checkpoint: {e}", style("⚠").yellow());
         }
@@ -2251,15 +2275,16 @@ fn run_missing(
 
     let expected_sig = Checkpoint {
         mode: "missing".into(),
-        mnemonic_pattern_hash: hash_mnemonic_pattern(mnemonic),
+        mnemonic_pattern_hash: hash_mnemonic_pattern(&mnemonic.to_ascii_lowercase()),
         address: address.unwrap_or("").to_string(),
         passphrase_hash: hash_passphrase(passphrase),
         account_start, account_end, address_start, address_end,
+        allow_typo,
         resume_index: 0,
         total_candidates: total,
         elapsed_ms_so_far: 0,
     };
-    let resume_index = resolve_resume_index(resume_path.as_deref(), &expected_sig)?;
+    let (resume_index, base_elapsed_ms) = resolve_resume_index(resume_path.as_deref(), &expected_sig)?;
 
     let pb = make_progress_bar(total);
     pb.set_position(resume_index);
@@ -2273,10 +2298,16 @@ fn run_missing(
         }
     };
 
+    // Resolved once and kept (not just moved into checkpoint_writer) so the
+    // interrupted-branch message below can tell "a checkpoint was written,
+    // here's the real path" apart from "no --checkpoint/--resume was given,
+    // nothing was saved" — see Task 11 code review, Critical #2.
+    let effective_checkpoint_path = checkpoint_path.or(resume_path);
     let stop = install_stop_flag();
     let write_checkpoint = checkpoint_writer(
-        checkpoint_path.or(resume_path),
+        effective_checkpoint_path.clone(),
         expected_sig,
+        base_elapsed_ms,
         std::time::Instant::now(),
     );
 
@@ -2287,11 +2318,38 @@ fn run_missing(
     pb.finish_with_message(if result.interrupted { "interrupted" } else { "done" });
 
     if result.interrupted {
-        eprintln!(
-            "\n{} Interrupted. Resume with:\n  seedcrypt-recover missing --mnemonic \"{mnemonic}\" {} --resume <checkpoint path>",
-            style("⏸").yellow(),
-            address.map(|a| format!("--address {a}")).unwrap_or_default(),
-        );
+        match &effective_checkpoint_path {
+            Some(path) => {
+                let mut cmd = vec![
+                    "seedcrypt-recover".to_string(),
+                    "missing".to_string(),
+                    format!("--mnemonic \"{mnemonic}\""),
+                ];
+                if let Some(a) = address {
+                    cmd.push(format!("--address {a}"));
+                }
+                cmd.push(format!("--passphrase \"{passphrase}\""));
+                cmd.push(format!("--account-start {account_start}"));
+                cmd.push(format!("--account-end {account_end}"));
+                cmd.push(format!("--address-start {address_start}"));
+                cmd.push(format!("--address-end {address_end}"));
+                if allow_typo {
+                    cmd.push("--allow-typo".to_string());
+                }
+                cmd.push(format!("--resume {path}"));
+                eprintln!(
+                    "\n{} Interrupted after {} candidates tested. Resume with:\n  {}",
+                    style("⏸").yellow(),
+                    result.combinations_tested,
+                    cmd.join(" "),
+                );
+            }
+            None => eprintln!(
+                "\n{} Interrupted after {} candidates tested. No checkpoint was saved — pass --checkpoint <path> next time to enable resuming.",
+                style("⏸").yellow(),
+                result.combinations_tested,
+            ),
+        }
         std::process::exit(130);
     }
 
@@ -2344,15 +2402,16 @@ fn run_typo(
 
     let expected_sig = Checkpoint {
         mode: "typo".into(),
-        mnemonic_pattern_hash: hash_mnemonic_pattern(mnemonic),
+        mnemonic_pattern_hash: hash_mnemonic_pattern(&mnemonic.to_ascii_lowercase()),
         address: address.to_string(),
         passphrase_hash: hash_passphrase(passphrase),
         account_start, account_end, address_start, address_end,
+        allow_typo: false,
         resume_index: 0,
         total_candidates: total,
         elapsed_ms_so_far: 0,
     };
-    let resume_index = resolve_resume_index(resume_path.as_deref(), &expected_sig)?;
+    let (resume_index, base_elapsed_ms) = resolve_resume_index(resume_path.as_deref(), &expected_sig)?;
 
     let pb = make_progress_bar(total);
     pb.set_position(resume_index);
@@ -2366,10 +2425,12 @@ fn run_typo(
         }
     };
 
+    let effective_checkpoint_path = checkpoint_path.or(resume_path);
     let stop = install_stop_flag();
     let write_checkpoint = checkpoint_writer(
-        checkpoint_path.or(resume_path),
+        effective_checkpoint_path.clone(),
         expected_sig,
+        base_elapsed_ms,
         std::time::Instant::now(),
     );
 
@@ -2380,10 +2441,33 @@ fn run_typo(
     pb.finish_with_message(if result.interrupted { "interrupted" } else { "done" });
 
     if result.interrupted {
-        eprintln!(
-            "\n{} Interrupted. Resume with:\n  seedcrypt-recover typo --mnemonic \"{mnemonic}\" --address {address} --resume <checkpoint path>",
-            style("⏸").yellow(),
-        );
+        match &effective_checkpoint_path {
+            Some(path) => {
+                let cmd = vec![
+                    "seedcrypt-recover".to_string(),
+                    "typo".to_string(),
+                    format!("--mnemonic \"{mnemonic}\""),
+                    format!("--address {address}"),
+                    format!("--passphrase \"{passphrase}\""),
+                    format!("--account-start {account_start}"),
+                    format!("--account-end {account_end}"),
+                    format!("--address-start {address_start}"),
+                    format!("--address-end {address_end}"),
+                    format!("--resume {path}"),
+                ];
+                eprintln!(
+                    "\n{} Interrupted after {} candidates tested. Resume with:\n  {}",
+                    style("⏸").yellow(),
+                    result.combinations_tested,
+                    cmd.join(" "),
+                );
+            }
+            None => eprintln!(
+                "\n{} Interrupted after {} candidates tested. No checkpoint was saved — pass --checkpoint <path> next time to enable resuming.",
+                style("⏸").yellow(),
+                result.combinations_tested,
+            ),
+        }
         std::process::exit(130);
     }
 
@@ -2457,15 +2541,16 @@ fn run_reorder(
     let permute_positions_str = permute_positions_1indexed.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
     let expected_sig = Checkpoint {
         mode: "reorder".into(),
-        mnemonic_pattern_hash: hash_mnemonic_pattern(&format!("{mnemonic}|permute:{permute_positions_str}")),
+        mnemonic_pattern_hash: hash_mnemonic_pattern(&format!("{}|permute:{permute_positions_str}", mnemonic.to_ascii_lowercase())),
         address: address.to_string(),
         passphrase_hash: hash_passphrase(passphrase),
         account_start, account_end, address_start, address_end,
+        allow_typo: false,
         resume_index: 0,
         total_candidates: total,
         elapsed_ms_so_far: 0,
     };
-    let resume_index = resolve_resume_index(resume_path.as_deref(), &expected_sig)?;
+    let (resume_index, base_elapsed_ms) = resolve_resume_index(resume_path.as_deref(), &expected_sig)?;
 
     let pb = make_progress_bar(total);
     pb.set_position(resume_index);
@@ -2479,10 +2564,12 @@ fn run_reorder(
         }
     };
 
+    let effective_checkpoint_path = checkpoint_path.or(resume_path);
     let stop = install_stop_flag();
     let write_checkpoint = checkpoint_writer(
-        checkpoint_path.or(resume_path),
+        effective_checkpoint_path.clone(),
         expected_sig,
+        base_elapsed_ms,
         std::time::Instant::now(),
     );
 
@@ -2492,10 +2579,34 @@ fn run_reorder(
     pb.finish_with_message(if result.interrupted { "interrupted" } else { "done" });
 
     if result.interrupted {
-        eprintln!(
-            "\n{} Interrupted. Resume with:\n  seedcrypt-recover reorder --mnemonic \"{mnemonic}\" --permute-positions {permute_positions_str} --address {address} --resume <checkpoint path>",
-            style("⏸").yellow(),
-        );
+        match &effective_checkpoint_path {
+            Some(path) => {
+                let cmd = vec![
+                    "seedcrypt-recover".to_string(),
+                    "reorder".to_string(),
+                    format!("--mnemonic \"{mnemonic}\""),
+                    format!("--permute-positions {permute_positions_str}"),
+                    format!("--address {address}"),
+                    format!("--passphrase \"{passphrase}\""),
+                    format!("--account-start {account_start}"),
+                    format!("--account-end {account_end}"),
+                    format!("--address-start {address_start}"),
+                    format!("--address-end {address_end}"),
+                    format!("--resume {path}"),
+                ];
+                eprintln!(
+                    "\n{} Interrupted after {} candidates tested. Resume with:\n  {}",
+                    style("⏸").yellow(),
+                    result.combinations_tested,
+                    cmd.join(" "),
+                );
+            }
+            None => eprintln!(
+                "\n{} Interrupted after {} candidates tested. No checkpoint was saved — pass --checkpoint <path> next time to enable resuming.",
+                style("⏸").yellow(),
+                result.combinations_tested,
+            ),
+        }
         std::process::exit(130);
     }
 
@@ -2553,6 +2664,7 @@ cat > /tmp/seedcrypt-test/cp.json <<'EOF'
   "address": "0x9858EfFD232B4033E47d90003D41EC34EcaEda94",
   "passphrase_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "account_start": 0, "account_end": 0, "address_start": 0, "address_end": 9,
+  "allow_typo": false,
   "resume_index": 0, "total_candidates": 2048, "elapsed_ms_so_far": 0
 }
 EOF
