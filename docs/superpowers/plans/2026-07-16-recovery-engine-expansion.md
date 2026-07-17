@@ -2893,12 +2893,170 @@ Expected: finds `about` as the 12th word, exactly as documented before this plan
 ```
 Expected: finds the corrected mnemonic with `abandon` at position 11, exactly as documented before this plan.
 
-- [ ] **Step 5: Commit**
+**Step 4 found a real, pre-existing bug** (confirmed present since the initial v0.1.0 commit, predating this entire plan — NOT a regression from Tasks 1-12): the `typo` subcommand's own README example doesn't work. See Task 14 below, added mid-execution with explicit user approval to fix this before Step 5's version-bump commit. Steps 1-4 above were verified correct in isolation (Steps 1-3 passed; Step 4's `missing` smoke test passed, its `typo` smoke test failed for the reason documented in Task 14) — **do not commit Step 5 until Task 14 is done**, since committing the version bump first would tag a release with a known, now-being-fixed bug.
+
+---
+
+### Task 14 (added mid-plan, user-approved): Fix `typo` mode to handle out-of-wordlist misspellings
+
+**Files:**
+- Modify: `src/recovery.rs`
+
+**Background:** `recover_typo`/`recover_typo_resumable` both call the shared `resolve_words(req)`, which requires *every* given word to already be a valid BIP39 wordlist entry — if even one word isn't found, it returns `None` immediately, and the search never starts (0 candidates tested, silent "No match found"). This is correct behavior for `missing` mode (where `?`-marked positions are the only ones allowed to be "wrong," and every other position genuinely must be a real, correctly-typed word). It is WRONG for `typo` mode, whose entire purpose is finding one word that might be incorrect — and the most realistic form of "incorrect" is a genuine fat-fingered misspelling that isn't a real BIP39 word at all (e.g. "abandun" for "abandon"), not just a valid-but-wrong substitution (e.g. "apple" instead of "abandon", which is what the existing `recover_typo_canonical_vector` test uses and which is why this bug shipped undetected). The README's own `typo` example (`abandun` at position 11) hits exactly this gap.
+
+**Fix:** `TypoSpace::candidate_at(index)` already sweeps `pos = index / 2048` through *every* position 0..N, trying all 2048 real words at `pos` while leaving `base_indices` untouched everywhere else. This means: if the one misspelled word's position is assigned *any* placeholder index (rather than causing the whole resolution to fail), the sweep still reaches `pos == that position` at some point in its `0..N*2048` range and correctly tries every real word there — candidates where `pos` is some *other* position will carry the placeholder at the misspelled slot and simply fail the checksum (wasted, but harmless — not a correctness problem, and with only 12-24 positions × 2048 candidates the total search is still trivially fast). So the fix is a new, typo-mode-specific word-resolution function that tolerates exactly one unresolvable word (using a placeholder for it) instead of hard-failing on any unresolvable word, while still rejecting 2+ unresolvable words as out of scope (this mode only searches for exactly one wrong word — 2+ genuinely can't be found by any single 0..N sweep, since at least one broken position would always remain uncorrected in every candidate).
+
+- [ ] **Step 1: Write the failing test**
+
+Add to the `#[cfg(test)] mod tests` block in `src/recovery.rs`, near `recover_typo_canonical_vector`:
+
+```rust
+    #[test]
+    fn recover_typo_finds_out_of_wordlist_misspelling() {
+        // Real seed: abandon×11 + about. Position 11 (0-indexed 10) is given
+        // as "abandun" — a genuine misspelling, NOT a valid BIP39 word (unlike
+        // recover_typo_canonical_vector's "apple", which IS a valid word, just
+        // the wrong one). This is the exact scenario the README's typo example
+        // demonstrates and the original bug this test guards against.
+        let words = vec![
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()),
+            Some("abandun".into()), // ← genuine misspelling, not in the wordlist
+            Some("about".into()),
+        ];
+        let req = RecoveryRequest {
+            seed_length: 12,
+            words,
+            validation: Some(ValidationConfig {
+                address: "0x9858EfFD232B4033E47d90003D41EC34EcaEda94".into(),
+                kind: DerivationType::EthereumStandard,
+                passphrase: String::new(),
+                account_start: 0,
+                account_end: 0,
+                address_start: 0,
+                address_end: 0,
+            }),
+            allow_typo: false,
+        };
+        let res = recover_typo(&req, |_| {});
+        assert!(res.mnemonic.is_some(), "should find the correction for a genuine misspelling, not just a valid-word substitution");
+        let m = res.mnemonic.unwrap();
+        assert_eq!(m[10], "abandon");
+    }
+
+    #[test]
+    fn recover_typo_rejects_two_unresolvable_words() {
+        // Two genuinely misspelled words — out of scope for "one word wrong"
+        // search (no single position-sweep can fix both simultaneously).
+        // Must fail cleanly (0 candidates), not panic or search forever.
+        let words = vec![
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandun".into()), // typo #1, not a real word
+            Some("abandun".into()), // typo #2, not a real word
+            Some("about".into()),
+        ];
+        let req = RecoveryRequest {
+            seed_length: 12,
+            words,
+            validation: None,
+            allow_typo: false,
+        };
+        let res = recover_typo(&req, |_| {});
+        assert!(res.mnemonic.is_none());
+        assert_eq!(res.combinations_tested, 0);
+    }
+```
+
+- [ ] **Step 2: Run**
+
+Run: `cargo test recover_typo_finds_out_of_wordlist_misspelling -- --nocapture` and `cargo test recover_typo_rejects_two_unresolvable_words -- --nocapture`
+Expected: BOTH FAIL. The first fails because `resolve_words` currently returns `None` for the whole request (0 candidates, `mnemonic: None`) since "abandun" isn't in the wordlist — this is the bug. The second may already pass by coincidence (it also expects `None`/`0`), but re-run it after Step 3 too to make sure it still passes for the *right* reason (explicit 2+-unresolved rejection, not just "the old blanket rejection happened to still apply").
+
+- [ ] **Step 3: Add `resolve_words_for_typo` and wire it into `recover_typo_resumable`**
+
+Add to `src/recovery.rs`, right after the existing `resolve_words` function:
+
+```rust
+/// Like `resolve_words`, but for `typo` mode specifically: tolerates up to
+/// one word that isn't a valid BIP39 word (the presumed typo), assigning it
+/// a placeholder index instead of failing resolution outright. `TypoSpace`'s
+/// search sweeps every position 0..N trying all 2048 real words at each —
+/// candidates where the swept position lands elsewhere still carry the
+/// placeholder at the misspelled slot and simply fail the checksum (wasted,
+/// harmless, and cheap given the total space is only N*2048). Returns `None`
+/// if 2+ words are unresolvable: this mode only searches for exactly one
+/// wrong word, and no single position-sweep can correct two simultaneously.
+fn resolve_words_for_typo(words: &[Option<String>]) -> Option<Vec<u16>> {
+    let map = word_index();
+    let mut base_indices = vec![0u16; words.len()];
+    let mut unresolved_count = 0usize;
+    for (i, w) in words.iter().enumerate() {
+        match w {
+            None => unresolved_count += 1,
+            Some(w) => match map.get(w.as_str()) {
+                Some(&idx) => base_indices[i] = idx,
+                None => unresolved_count += 1,
+            },
+        }
+    }
+    if unresolved_count > 1 {
+        return None;
+    }
+    Some(base_indices)
+}
+```
+
+Then in `recover_typo_resumable`, replace:
+
+```rust
+    let Some((base_indices, _missing_positions, _known_positions)) = resolve_words(req) else {
+        return RecoveryResult { mnemonic: None, combinations_tested: 0, elapsed_ms: start.elapsed().as_millis(), interrupted: false };
+    };
+```
+
+with:
+
+```rust
+    let Some(base_indices) = resolve_words_for_typo(&req.words) else {
+        return RecoveryResult { mnemonic: None, combinations_tested: 0, elapsed_ms: start.elapsed().as_millis(), interrupted: false };
+    };
+```
+
+(`recover_missing_resumable` keeps calling the original `resolve_words` unchanged — this fix is scoped to `typo` mode only. `missing --allow-typo`'s analogous edge case — a "known" word that's itself unresolvable — is a separate, lower-priority gap not addressed here; flag it as a follow-up note rather than fixing it in this pass.)
+
+- [ ] **Step 4: Run**
+
+Run: `cargo test recover_typo_finds_out_of_wordlist_misspelling -- --nocapture` and `cargo test recover_typo_rejects_two_unresolvable_words -- --nocapture`
+Expected: BOTH PASS now.
+
+- [ ] **Step 5: Run the full test suite**
+
+Run: `cargo test`
+Expected: all tests pass (58 now: 56 + these 2 new tests).
+
+- [ ] **Step 6: Re-run Task 13 Step 4's `typo` smoke test to confirm the README example now works**
 
 ```bash
-git add Cargo.toml
-git commit -m "chore: bump version to 0.2.0"
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo build --release
+./target/release/seedcrypt-recover typo \
+  --mnemonic "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandun about" \
+  --address 0x9858EfFD232B4033E47d90003D41EC34EcaEda94
 ```
+Expected: finds the corrected mnemonic with `abandon` at position 11 — matching what Task 13's Step 4 originally expected but didn't get.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/recovery.rs
+git commit -m "fix: typo mode now finds genuine misspellings, not just valid-word substitutions"
+```
+
+**Then return to Task 13 and complete its Step 5** (the `Cargo.toml` version-bump commit), now that the codebase this version tags actually matches its own documentation.
 
 ---
 
