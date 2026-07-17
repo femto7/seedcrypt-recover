@@ -2052,6 +2052,14 @@ mod tests {
     }
 
     #[test]
+    fn matches_signature_detects_allow_typo_mismatch() {
+        let a = sample(0);
+        let mut b = sample(0);
+        b.allow_typo = true;
+        assert!(!a.matches_signature(&b));
+    }
+
+    #[test]
     fn load_missing_file_gives_clear_error() {
         let path = std::env::temp_dir().join("seedcrypt-recover-definitely-does-not-exist.json");
         let err = Checkpoint::load(&path).unwrap_err();
@@ -2221,6 +2229,15 @@ fn checkpoint_writer(
         }
     }
 }
+
+/// Renders `s` as a double-quoted, shell-safe argument for the printed
+/// resume command (escapes `\` and `"` for a bash double-quoted context —
+/// the README's examples are all bash). Only needed for the passphrase:
+/// mnemonic words come from the fixed BIP39 English wordlist and can never
+/// contain quotes/backslashes, but a passphrase is arbitrary user input.
+fn shell_quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
 ```
 
 - [ ] **Step 3: Wire `run_missing`**
@@ -2328,7 +2345,7 @@ fn run_missing(
                 if let Some(a) = address {
                     cmd.push(format!("--address {a}"));
                 }
-                cmd.push(format!("--passphrase \"{passphrase}\""));
+                cmd.push(format!("--passphrase {}", shell_quote(passphrase)));
                 cmd.push(format!("--account-start {account_start}"));
                 cmd.push(format!("--account-end {account_end}"));
                 cmd.push(format!("--address-start {address_start}"));
@@ -2340,14 +2357,14 @@ fn run_missing(
                 eprintln!(
                     "\n{} Interrupted after {} candidates tested. Resume with:\n  {}",
                     style("⏸").yellow(),
-                    result.combinations_tested,
+                    resume_index + result.combinations_tested,
                     cmd.join(" "),
                 );
             }
             None => eprintln!(
                 "\n{} Interrupted after {} candidates tested. No checkpoint was saved — pass --checkpoint <path> next time to enable resuming.",
                 style("⏸").yellow(),
-                result.combinations_tested,
+                resume_index + result.combinations_tested,
             ),
         }
         std::process::exit(130);
@@ -2448,7 +2465,7 @@ fn run_typo(
                     "typo".to_string(),
                     format!("--mnemonic \"{mnemonic}\""),
                     format!("--address {address}"),
-                    format!("--passphrase \"{passphrase}\""),
+                    format!("--passphrase {}", shell_quote(passphrase)),
                     format!("--account-start {account_start}"),
                     format!("--account-end {account_end}"),
                     format!("--address-start {address_start}"),
@@ -2458,14 +2475,14 @@ fn run_typo(
                 eprintln!(
                     "\n{} Interrupted after {} candidates tested. Resume with:\n  {}",
                     style("⏸").yellow(),
-                    result.combinations_tested,
+                    resume_index + result.combinations_tested,
                     cmd.join(" "),
                 );
             }
             None => eprintln!(
                 "\n{} Interrupted after {} candidates tested. No checkpoint was saved — pass --checkpoint <path> next time to enable resuming.",
                 style("⏸").yellow(),
-                result.combinations_tested,
+                resume_index + result.combinations_tested,
             ),
         }
         std::process::exit(130);
@@ -2587,7 +2604,7 @@ fn run_reorder(
                     format!("--mnemonic \"{mnemonic}\""),
                     format!("--permute-positions {permute_positions_str}"),
                     format!("--address {address}"),
-                    format!("--passphrase \"{passphrase}\""),
+                    format!("--passphrase {}", shell_quote(passphrase)),
                     format!("--account-start {account_start}"),
                     format!("--account-end {account_end}"),
                     format!("--address-start {address_start}"),
@@ -2597,14 +2614,14 @@ fn run_reorder(
                 eprintln!(
                     "\n{} Interrupted after {} candidates tested. Resume with:\n  {}",
                     style("⏸").yellow(),
-                    result.combinations_tested,
+                    resume_index + result.combinations_tested,
                     cmd.join(" "),
                 );
             }
             None => eprintln!(
                 "\n{} Interrupted after {} candidates tested. No checkpoint was saved — pass --checkpoint <path> next time to enable resuming.",
                 style("⏸").yellow(),
-                result.combinations_tested,
+                resume_index + result.combinations_tested,
             ),
         }
         std::process::exit(130);
