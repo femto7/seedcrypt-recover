@@ -2871,6 +2871,6 @@ git commit -m "chore: bump version to 0.2.0"
 - `seedcrypt_recover::lehmer::{factorial, nth_permutation}`
 - `seedcrypt_recover::candidate_space::{CandidateSpace, MissingSpace, TypoSpace, MissingTypoSpace, ReorderSpace}`
 - `seedcrypt_recover::search::{run_chunked_search, SearchOutcome, CHUNK_SIZE}`
-- `seedcrypt_recover::checkpoint::{Checkpoint, hash_passphrase}`
+- `seedcrypt_recover::checkpoint::{Checkpoint, hash_passphrase, hash_mnemonic_pattern}`
 - `seedcrypt_recover::recovery::{recover_missing_resumable, recover_typo_resumable, recover_reorder, recover_reorder_resumable, RecoveryRequest::allow_typo, RecoveryResult::interrupted}`
 - CLI: `seedcrypt-recover reorder`, `missing --allow-typo`, `--checkpoint`/`--resume` on all three subcommands.
