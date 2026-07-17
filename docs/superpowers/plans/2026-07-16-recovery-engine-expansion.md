@@ -3058,6 +3058,8 @@ git commit -m "fix: typo mode now finds genuine misspellings, not just valid-wor
 
 **Then return to Task 13 and complete its Step 5** (the `Cargo.toml` version-bump commit), now that the codebase this version tags actually matches its own documentation.
 
+**Post-review fixup (commit `d126fc5`, on top of `35e9e01`):** code review of this task found `resolve_words_for_typo`'s doc comment overclaimed — off-sweep candidates aren't unconditionally "harmless"; roughly 1/16 pass a 12-word mnemonic's 4-bit checksum by chance, a property inherent to `TypoSpace`'s search generally (checksum-only or not), pre-existing since v0.1.0, not a regression from this task. The CLI's `typo` subcommand always requires `--address`, so end users never hit this — only direct library/FFI callers passing `validation: None` are exposed. Fixed: corrected `resolve_words_for_typo`'s doc comment, added an explicit reliability warning to `recover_typo`'s public doc comment recommending address validation, and added `recover_typo_finds_misspelling_at_first_position`/`recover_typo_finds_misspelling_at_last_position` regression tests (both prior tests only covered a middle position) — reusing the same canonical `abandon×11 + about` vector and address, with the misspelling moved to position 0 or 11 instead of 10. Full suite: 60 tests (58 + these 2).
+
 ---
 
 ## Summary of new public API surface
