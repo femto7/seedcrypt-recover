@@ -167,6 +167,14 @@ mod tests {
     }
 
     #[test]
+    fn matches_signature_detects_allow_typo_mismatch() {
+        let a = sample(0);
+        let mut b = sample(0);
+        b.allow_typo = true;
+        assert!(!a.matches_signature(&b));
+    }
+
+    #[test]
     fn load_missing_file_gives_clear_error() {
         let path = std::env::temp_dir().join("seedcrypt-recover-definitely-does-not-exist.json");
         let err = Checkpoint::load(&path).unwrap_err();
