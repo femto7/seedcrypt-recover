@@ -266,12 +266,31 @@ fn checkpoint_writer(
 }
 
 /// Renders `s` as a double-quoted, shell-safe argument for the printed
-/// resume command (escapes `\` and `"` for a bash double-quoted context —
-/// the README's examples are all bash). Only needed for the passphrase:
-/// mnemonic words come from the fixed BIP39 English wordlist and can never
-/// contain quotes/backslashes, but a passphrase is arbitrary user input.
+/// resume command (escapes `\`, `"`, `$`, and `` ` `` for a bash
+/// double-quoted context — the README's examples are all bash, and these
+/// four characters are exactly what bash still treats specially inside
+/// double quotes: `\`/`"` end quoting or escape the next character, `$`
+/// triggers variable/command substitution, `` ` `` triggers legacy command
+/// substitution). Not a complete shell-escaping implementation (e.g.
+/// interactive `!` history expansion under `set -H` is out of scope), but
+/// covers the realistic risk: a user pasting an address, checkpoint path,
+/// or passphrase from an untrusted source, then blindly copy-pasting this
+/// tool's own suggested resume command without reading it first. Applied
+/// to the address and checkpoint path too, not just the passphrase — a
+/// crafted address survives this crate's coin-detection (which only checks
+/// a leading-character prefix, not a full charset/length validation) and a
+/// checkpoint path may contain spaces or shell metacharacters regardless
+/// of malicious intent. Mnemonic words are the one exception left
+/// unquoted: they come from the fixed BIP39 English wordlist and can never
+/// contain any of these characters.
 fn shell_quote(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    format!(
+        "\"{}\"",
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('$', "\\$")
+            .replace('`', "\\`")
+    )
 }
 
 fn run_missing(
@@ -372,7 +391,7 @@ fn run_missing(
                     format!("--mnemonic \"{mnemonic}\""),
                 ];
                 if let Some(a) = address {
-                    cmd.push(format!("--address {a}"));
+                    cmd.push(format!("--address {}", shell_quote(a)));
                 }
                 cmd.push(format!("--passphrase {}", shell_quote(passphrase)));
                 cmd.push(format!("--account-start {account_start}"));
@@ -382,7 +401,7 @@ fn run_missing(
                 if allow_typo {
                     cmd.push("--allow-typo".to_string());
                 }
-                cmd.push(format!("--resume {path}"));
+                cmd.push(format!("--resume {}", shell_quote(path)));
                 eprintln!(
                     "\n{} Interrupted after {} candidates tested. Resume with:\n  {}",
                     style("⏸").yellow(),
@@ -475,13 +494,13 @@ fn run_typo(
                     "seedcrypt-recover".to_string(),
                     "typo".to_string(),
                     format!("--mnemonic \"{mnemonic}\""),
-                    format!("--address {address}"),
+                    format!("--address {}", shell_quote(address)),
                     format!("--passphrase {}", shell_quote(passphrase)),
                     format!("--account-start {account_start}"),
                     format!("--account-end {account_end}"),
                     format!("--address-start {address_start}"),
                     format!("--address-end {address_end}"),
-                    format!("--resume {path}"),
+                    format!("--resume {}", shell_quote(path)),
                 ];
                 eprintln!(
                     "\n{} Interrupted after {} candidates tested. Resume with:\n  {}",
@@ -596,13 +615,13 @@ fn run_reorder(
                     "reorder".to_string(),
                     format!("--mnemonic \"{mnemonic}\""),
                     format!("--permute-positions {permute_positions_str}"),
-                    format!("--address {address}"),
+                    format!("--address {}", shell_quote(address)),
                     format!("--passphrase {}", shell_quote(passphrase)),
                     format!("--account-start {account_start}"),
                     format!("--account-end {account_end}"),
                     format!("--address-start {address_start}"),
                     format!("--address-end {address_end}"),
-                    format!("--resume {path}"),
+                    format!("--resume {}", shell_quote(path)),
                 ];
                 eprintln!(
                     "\n{} Interrupted after {} candidates tested. Resume with:\n  {}",
