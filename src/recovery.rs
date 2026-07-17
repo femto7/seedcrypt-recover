@@ -107,10 +107,15 @@ fn resolve_words(req: &RecoveryRequest) -> Option<(Vec<u16>, Vec<usize>, Vec<usi
 /// a placeholder index instead of failing resolution outright. `TypoSpace`'s
 /// search sweeps every position 0..N trying all 2048 real words at each —
 /// candidates where the swept position lands elsewhere still carry the
-/// placeholder at the misspelled slot and simply fail the checksum (wasted,
-/// harmless, and cheap given the total space is only N*2048). Returns `None`
-/// if 2+ words are unresolvable: this mode only searches for exactly one
-/// wrong word, and no single position-sweep can correct two simultaneously.
+/// placeholder at the misspelled slot, which is *usually* wasted work (it
+/// fails checksum) but not guaranteed to be: roughly 1/16 of candidates at
+/// any fixed position pass a 12-word mnemonic's 4-bit checksum by chance.
+/// This isn't specific to the placeholder value — it's inherent to
+/// `TypoSpace`'s search in general, checksum-only or not (see
+/// `recover_typo`'s doc comment for the mitigation: pass `validation`).
+/// Returns `None` if 2+ words are unresolvable: this mode only searches for
+/// exactly one wrong word, and no single position-sweep can correct two
+/// simultaneously.
 fn resolve_words_for_typo(words: &[Option<String>]) -> Option<Vec<u16>> {
     let map = word_index();
     let mut base_indices = vec![0u16; words.len()];
@@ -258,6 +263,16 @@ pub fn recover_missing_resumable(
 }
 
 /// Try replacing each position with all 2048 BIP39 words (single typo).
+///
+/// Address validation (`req.validation`) is strongly recommended for this
+/// mode specifically: a 12-word mnemonic's checksum is only 4 bits, so
+/// roughly 1 in 16 wrong-word substitutions at a given position pass it by
+/// chance — checksum-only (`validation: None`) typo search has a real,
+/// non-negligible chance of confidently returning an incorrect "match"
+/// rather than the true correction. This is a property of the search space
+/// itself, not a bug — the CLI's `typo` subcommand always requires
+/// `--address` for exactly this reason; direct library/FFI callers should
+/// do the same wherever possible.
 pub fn recover_typo(
     req: &RecoveryRequest,
     progress: impl Fn(u64) + Sync + Send,
@@ -502,6 +517,71 @@ mod tests {
         let res = recover_typo(&req, |_| {});
         assert!(res.mnemonic.is_none());
         assert_eq!(res.combinations_tested, 0);
+    }
+
+    #[test]
+    fn recover_typo_finds_misspelling_at_first_position() {
+        // Same canonical seed (abandon×11 + about), but the FIRST word (not
+        // a middle one) is misspelled — regression coverage for the
+        // position-0 edge of TypoSpace's sweep.
+        let words = vec![
+            Some("abandom".into()), // ← genuine misspelling at position 0
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()),
+            Some("about".into()),
+        ];
+        let req = RecoveryRequest {
+            seed_length: 12,
+            words,
+            validation: Some(ValidationConfig {
+                address: "0x9858EfFD232B4033E47d90003D41EC34EcaEda94".into(),
+                kind: DerivationType::EthereumStandard,
+                passphrase: String::new(),
+                account_start: 0,
+                account_end: 0,
+                address_start: 0,
+                address_end: 0,
+            }),
+            allow_typo: false,
+        };
+        let res = recover_typo(&req, |_| {});
+        assert!(res.mnemonic.is_some(), "should find the correction when the misspelling is at position 0");
+        let m = res.mnemonic.unwrap();
+        assert_eq!(m[0], "abandon");
+    }
+
+    #[test]
+    fn recover_typo_finds_misspelling_at_last_position() {
+        // Same canonical seed, but the LAST word is misspelled instead of a
+        // middle one — regression coverage for the position-(N-1) edge of
+        // TypoSpace's sweep.
+        let words = vec![
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()),
+            Some("abaut".into()), // ← genuine misspelling at the last position
+        ];
+        let req = RecoveryRequest {
+            seed_length: 12,
+            words,
+            validation: Some(ValidationConfig {
+                address: "0x9858EfFD232B4033E47d90003D41EC34EcaEda94".into(),
+                kind: DerivationType::EthereumStandard,
+                passphrase: String::new(),
+                account_start: 0,
+                account_end: 0,
+                address_start: 0,
+                address_end: 0,
+            }),
+            allow_typo: false,
+        };
+        let res = recover_typo(&req, |_| {});
+        assert!(res.mnemonic.is_some(), "should find the correction when the misspelling is at the last position");
+        let m = res.mnemonic.unwrap();
+        assert_eq!(m[11], "about");
     }
 
     #[test]
