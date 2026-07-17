@@ -29,6 +29,13 @@ pub struct Checkpoint {
     pub account_end: u32,
     pub address_start: u32,
     pub address_end: u32,
+    /// Whether `missing --allow-typo` was set. Part of the resume
+    /// signature because it selects a structurally different candidate
+    /// space (`MissingSpace` vs `MissingTypoSpace`, with a different
+    /// `total()`) — resuming with a flipped value would silently apply a
+    /// stale index to the wrong space instead of erroring. Always `false`
+    /// for `typo`/`reorder` mode, which don't have this flag.
+    pub allow_typo: bool,
     pub resume_index: u64,
     pub total_candidates: u64,
     pub elapsed_ms_so_far: u128,
@@ -64,6 +71,7 @@ impl Checkpoint {
             && self.account_end == other.account_end
             && self.address_start == other.address_start
             && self.address_end == other.address_end
+            && self.allow_typo == other.allow_typo
     }
 
     /// Atomic write: write to a `.tmp` sibling then rename over the target,
@@ -113,6 +121,7 @@ mod tests {
             account_end: 0,
             address_start: 0,
             address_end: 9,
+            allow_typo: false,
             resume_index,
             total_candidates: 2048,
             elapsed_ms_so_far: 1234,
