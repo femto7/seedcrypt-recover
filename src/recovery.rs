@@ -102,6 +102,34 @@ fn resolve_words(req: &RecoveryRequest) -> Option<(Vec<u16>, Vec<usize>, Vec<usi
     Some((known_indices, missing_positions, known_positions))
 }
 
+/// Like `resolve_words`, but for `typo` mode specifically: tolerates up to
+/// one word that isn't a valid BIP39 word (the presumed typo), assigning it
+/// a placeholder index instead of failing resolution outright. `TypoSpace`'s
+/// search sweeps every position 0..N trying all 2048 real words at each —
+/// candidates where the swept position lands elsewhere still carry the
+/// placeholder at the misspelled slot and simply fail the checksum (wasted,
+/// harmless, and cheap given the total space is only N*2048). Returns `None`
+/// if 2+ words are unresolvable: this mode only searches for exactly one
+/// wrong word, and no single position-sweep can correct two simultaneously.
+fn resolve_words_for_typo(words: &[Option<String>]) -> Option<Vec<u16>> {
+    let map = word_index();
+    let mut base_indices = vec![0u16; words.len()];
+    let mut unresolved_count = 0usize;
+    for (i, w) in words.iter().enumerate() {
+        match w {
+            None => unresolved_count += 1,
+            Some(w) => match map.get(w.as_str()) {
+                Some(&idx) => base_indices[i] = idx,
+                None => unresolved_count += 1,
+            },
+        }
+    }
+    if unresolved_count > 1 {
+        return None;
+    }
+    Some(base_indices)
+}
+
 /// Builds the shared per-candidate test closure: checksum-validate, then
 /// (if a `ValidationConfig` is set) derive addresses and compare. On match,
 /// records the mnemonic and flips `found`.
@@ -246,7 +274,7 @@ pub fn recover_typo_resumable(
     on_chunk_complete: impl FnMut(u64),
 ) -> RecoveryResult {
     let start = std::time::Instant::now();
-    let Some((base_indices, _missing_positions, _known_positions)) = resolve_words(req) else {
+    let Some(base_indices) = resolve_words_for_typo(&req.words) else {
         return RecoveryResult { mnemonic: None, combinations_tested: 0, elapsed_ms: start.elapsed().as_millis(), interrupted: false };
     };
 
@@ -415,6 +443,65 @@ mod tests {
         assert!(res.mnemonic.is_some(), "should find the typo correction");
         assert_eq!(res.mnemonic.as_ref().unwrap()[10], "abandon");
         assert!(!res.interrupted);
+    }
+
+    #[test]
+    fn recover_typo_finds_out_of_wordlist_misspelling() {
+        // Real seed: abandon×11 + about. Position 11 (0-indexed 10) is given
+        // as "abandun" — a genuine misspelling, NOT a valid BIP39 word (unlike
+        // recover_typo_canonical_vector's "apple", which IS a valid word, just
+        // the wrong one). This is the exact scenario the README's typo example
+        // demonstrates and the original bug this test guards against.
+        let words = vec![
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()),
+            Some("abandun".into()), // ← genuine misspelling, not in the wordlist
+            Some("about".into()),
+        ];
+        let req = RecoveryRequest {
+            seed_length: 12,
+            words,
+            validation: Some(ValidationConfig {
+                address: "0x9858EfFD232B4033E47d90003D41EC34EcaEda94".into(),
+                kind: DerivationType::EthereumStandard,
+                passphrase: String::new(),
+                account_start: 0,
+                account_end: 0,
+                address_start: 0,
+                address_end: 0,
+            }),
+            allow_typo: false,
+        };
+        let res = recover_typo(&req, |_| {});
+        assert!(res.mnemonic.is_some(), "should find the correction for a genuine misspelling, not just a valid-word substitution");
+        let m = res.mnemonic.unwrap();
+        assert_eq!(m[10], "abandon");
+    }
+
+    #[test]
+    fn recover_typo_rejects_two_unresolvable_words() {
+        // Two genuinely misspelled words — out of scope for "one word wrong"
+        // search (no single position-sweep can fix both simultaneously).
+        // Must fail cleanly (0 candidates), not panic or search forever.
+        let words = vec![
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandon".into()), Some("abandon".into()), Some("abandon".into()),
+            Some("abandun".into()), // typo #1, not a real word
+            Some("abandun".into()), // typo #2, not a real word
+            Some("about".into()),
+        ];
+        let req = RecoveryRequest {
+            seed_length: 12,
+            words,
+            validation: None,
+            allow_typo: false,
+        };
+        let res = recover_typo(&req, |_| {});
+        assert!(res.mnemonic.is_none());
+        assert_eq!(res.combinations_tested, 0);
     }
 
     #[test]
