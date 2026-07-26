@@ -1,6 +1,6 @@
 [package]
 name = "seedcrypt-recover"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Fast offline BIP39 seed recovery tool with address validation. btcrecover-equivalent in Rust."
 license = "MIT"
@@ -38,6 +38,12 @@ thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ctrlc = "3.4"
+
+# Detecting a double-click (see owns_console() in main.rs) needs
+# GetConsoleProcessList. windows-sys is already in the dependency tree via
+# other crates, so this adds no build cost.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
 proptest = "1"

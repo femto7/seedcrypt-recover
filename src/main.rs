@@ -119,7 +119,85 @@ enum Command {
     },
 }
 
-fn main() -> Result<()> {
+/// True when this process is the only one attached to its console.
+///
+/// On Windows that means the console was created *for us* — i.e. the exe was
+/// double-clicked in Explorer. When it's launched from an existing PowerShell
+/// or cmd, that shell is attached too and the count is at least 2.
+#[cfg(windows)]
+fn owns_console() -> bool {
+    use windows_sys::Win32::System::Console::GetConsoleProcessList;
+    let mut pids = [0u32; 2];
+    // Returns the number of processes sharing this console. 1 == just us.
+    unsafe { GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) == 1 }
+}
+
+#[cfg(not(windows))]
+fn owns_console() -> bool {
+    // Nothing to do elsewhere: a terminal that ran the binary stays open.
+    false
+}
+
+fn wait_for_enter() {
+    use std::io::{BufRead, Write};
+    print!("\nPress Enter to close this window...");
+    let _ = std::io::stdout().flush();
+    let mut discard = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut discard);
+}
+
+/// Shown when the exe is double-clicked instead of run from a terminal.
+///
+/// Without this the window opens and vanishes in the same frame, which reads
+/// as "the tool is broken" — and the people reaching for a seed-recovery tool
+/// are the least likely to know that a CLI needs arguments.
+fn print_double_click_help() {
+    println!("SeedCrypt Recover {}\n", env!("CARGO_PKG_VERSION"));
+    println!("This is a command-line tool — it has no window of its own, so");
+    println!("double-clicking it cannot do anything useful.\n");
+    println!("To use it, open a terminal in this folder:\n");
+    println!("  1. Hold Shift and right-click inside this folder in Explorer");
+    println!("  2. Choose \"Open PowerShell window here\" (or \"Open in Terminal\")");
+    println!("  3. Run a command, for example:\n");
+    println!("     .\\seedcrypt-recover.exe missing \\");
+    println!("        --mnemonic \"legal winner thank ? ? about\" \\");
+    println!("        --address bc1q...\n");
+    println!("Commands: missing (lost words) · typo (misspelled word) · reorder (wrong order)");
+    println!("Run  .\\seedcrypt-recover.exe --help  to see every option.\n");
+    println!("Full guide: https://seedcrypt.app/recover");
+}
+
+fn main() {
+    let from_explorer = owns_console();
+
+    // Double-clicked with no arguments: explain, and hold the window open.
+    if from_explorer && std::env::args_os().len() == 1 {
+        print_double_click_help();
+        wait_for_enter();
+        return;
+    }
+
+    // Matches what `fn main() -> Result<()>` printed before, so error output is
+    // unchanged for terminal users.
+    let code = match dispatch() {
+        Ok(()) => 0,
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            1
+        }
+    };
+
+    // Any run started from Explorer (a shortcut carrying arguments, say) would
+    // otherwise close before its result — including the error above — could be
+    // read.
+    if from_explorer {
+        wait_for_enter();
+    }
+
+    std::process::exit(code);
+}
+
+fn dispatch() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Missing {

@@ -808,7 +808,7 @@ dependencies = [
 
 [[package]]
 name = "seedcrypt-recover"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bech32",
@@ -830,6 +830,7 @@ dependencies = [
  "sha2",
  "sha3",
  "thiserror",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
