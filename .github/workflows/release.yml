@@ -1,0 +1,112 @@
+name: Release
+
+# Builds the CLI for every supported platform and attaches the archives to the
+# GitHub Release for the tag that triggered the run.
+#
+# macOS and Linux binaries cannot be produced from the Windows dev machine
+# (cross-linking Linux needs a foreign linker, and macOS needs the Apple SDK),
+# so this workflow is the only path to a complete release.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:      # lets a release be re-run without moving the tag
+
+permissions:
+  contents: write         # required to upload assets onto the release
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false    # one platform failing must not discard the others
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: macos-latest          # Apple Silicon runner
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-13              # last Intel runner
+            target: x86_64-apple-darwin
+            archive: tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Test
+        run: cargo test --target ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          NAME="seedcrypt-recover-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$NAME"
+          cp target/${{ matrix.target }}/release/seedcrypt-recover "dist/$NAME/"
+          cp README.md LICENSE "dist/$NAME/" 2>/dev/null || cp README.md "dist/$NAME/"
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          echo "ASSET=dist/$NAME.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        shell: bash
+        run: |
+          NAME="seedcrypt-recover-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$NAME"
+          cp target/${{ matrix.target }}/release/seedcrypt-recover.exe "dist/$NAME/"
+          cp README.md LICENSE "dist/$NAME/" 2>/dev/null || cp README.md "dist/$NAME/"
+          powershell -Command "Compress-Archive -Path 'dist/$NAME/*' -DestinationPath 'dist/$NAME.zip'"
+          echo "ASSET=dist/$NAME.zip" >> "$GITHUB_ENV"
+
+      # A recovery tool is exactly the kind of binary a user should be able to
+      # verify before running it against their own seed phrase.
+      - name: Checksum
+        shell: bash
+        run: |
+          cd "$(dirname "$ASSET")"
+          F="$(basename "$ASSET")"
+          if command -v sha256sum >/dev/null; then sha256sum "$F" > "$F.sha256";
+          else shasum -a 256 "$F" > "$F.sha256"; fi
+          cat "$F.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Attach to release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
