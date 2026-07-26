@@ -25,15 +25,25 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
+            test: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
+            test: true
           - os: macos-latest          # Apple Silicon runner
             target: aarch64-apple-darwin
             archive: tar.gz
-          - os: macos-13              # last Intel runner
+            test: true
+          # Intel macOS is cross-compiled from the Apple Silicon runner: the
+          # macos-13 Intel runners have been retired, and a job requesting them
+          # queues forever — which blocks `publish` (needs: build) and ships
+          # nothing at all. Xcode carries both slices, so the arm64 runner
+          # builds this target natively. Tests are skipped here rather than run
+          # under Rosetta; the same code is tested on aarch64 above.
+          - os: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
+            test: false
 
     steps:
       - uses: actions/checkout@v4
@@ -48,6 +58,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Test
+        if: matrix.test
         run: cargo test --target ${{ matrix.target }}
 
       - name: Build
