@@ -1,9 +1,11 @@
 //! CLI for SeedCrypt Recover.
 
+mod ui;
+
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use console::style;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::path::PathBuf;
@@ -152,22 +154,45 @@ fn wait_for_enter() {
 /// as "the tool is broken" — and the people reaching for a seed-recovery tool
 /// are the least likely to know that a CLI needs arguments.
 fn print_double_click_help() {
-    println!("SeedCrypt Recover {}\n", env!("CARGO_PKG_VERSION"));
-    println!("This is a command-line tool — it has no window of its own, so");
-    println!("double-clicking it cannot do anything useful.\n");
-    println!("To use it, open a terminal in this folder:\n");
-    println!("  1. Hold Shift and right-click inside this folder in Explorer");
-    println!("  2. Choose \"Open PowerShell window here\" (or \"Open in Terminal\")");
-    println!("  3. Run a command, for example:\n");
-    println!("     .\\seedcrypt-recover.exe missing \\");
-    println!("        --mnemonic \"legal winner thank ? ? about\" \\");
-    println!("        --address bc1q...\n");
-    println!("Commands: missing (lost words) · typo (misspelled word) · reorder (wrong order)");
-    println!("Run  .\\seedcrypt-recover.exe --help  to see every option.\n");
-    println!("Full guide: https://seedcrypt.app/recover");
+    ui::print_banner();
+
+    ui::print_rule(Some("THIS PROGRAM RUNS IN A TERMINAL"));
+    ui::blank();
+    ui::body("Double-clicking cannot start a recovery: the program has no window");
+    ui::body("of its own, and it needs to be told what to look for.");
+    ui::blank();
+    ui::body("1  Hold Shift, right-click an empty spot in this folder.");
+    ui::body("2  Choose \"Open PowerShell window here\" or \"Open in Terminal\".");
+    ui::body("3  Type one of the commands below, then press Enter.");
+    ui::blank();
+
+    ui::print_rule(Some("COMMANDS"));
+    ui::blank();
+    ui::kv("missing", "one or more words are gone — mark each one with ?");
+    ui::kv("typo", "every word is there, but one of them is wrong");
+    ui::kv("reorder", "every word is there, in the wrong order");
+    ui::blank();
+    ui::body("Shape of a command (backtick = continue on the next line):");
+    ui::blank();
+    // PowerShell continuations, not bash `\` — this screen exists to be pasted
+    // into the very PowerShell window the step above tells them to open.
+    println!(".\\seedcrypt-recover.exe missing `");
+    println!("   --mnemonic \"the words you still have, with ? for each gap\" `");
+    println!("   --address one-address-this-wallet-has-used");
+    ui::blank();
+
+    ui::print_rule(Some("MORE"));
+    ui::blank();
+    ui::kv("all options", ".\\seedcrypt-recover.exe --help");
+    ui::kv("full guide", "https://seedcrypt.app/recover");
+    ui::blank();
 }
 
 fn main() {
+    // Must run before any output: decides the glyph set and asks a Windows
+    // console for UTF-8.
+    ui::init();
+
     let from_explorer = owns_console();
 
     // Double-clicked with no arguments: explain, and hold the window open.
@@ -176,6 +201,8 @@ fn main() {
         wait_for_enter();
         return;
     }
+
+    ui::print_banner();
 
     // Matches what `fn main() -> Result<()>` printed before, so error output is
     // unchanged for terminal users.
@@ -262,12 +289,7 @@ fn build_validation(
 
 fn make_progress_bar(total: u64) -> ProgressBar {
     let pb = ProgressBar::new(total);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.cyan} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({per_sec}) ETA {eta}")
-            .unwrap()
-            .progress_chars("##-"),
-    );
+    pb.set_style(ui::progress_style());
     pb
 }
 
@@ -400,21 +422,24 @@ fn run_missing(
 
     let validation = build_validation(address, passphrase, account_start, account_end, address_start, address_end)?;
 
-    println!(
-        "{} Searching {} missing word(s) in a {}-word seed{}{}",
-        style("⚙").cyan(),
-        missing_count,
-        n,
-        if validation.is_some() { " with address validation" } else { " (checksum only)" },
-        if allow_typo { ", also allowing one typo among known words" } else { "" },
-    );
-
     let known_count = n - missing_count;
     let total: u64 = if allow_typo {
         2048u64.pow(missing_count as u32) * (1 + known_count as u64 * 2048)
     } else {
         2048u64.pow(missing_count as u32)
     };
+
+    let mut rows = vec![(
+        "unknown",
+        format!("{missing_count} slot(s) marked with ?"),
+    )];
+    if allow_typo {
+        rows.push(("also trying", "one substitution among the known words".to_string()));
+    }
+    if !passphrase.is_empty() {
+        rows.push(("passphrase", "provided".to_string()));
+    }
+    ui::print_run_header("fill missing words", n, &rows, total, address, checkpoint_path.as_deref());
 
     let expected_sig = Checkpoint {
         mode: "missing".into(),
@@ -458,7 +483,7 @@ fn run_missing(
     let result = seedcrypt_recover::recovery::recover_missing_resumable(
         &req, resume_index, &stop, progress, write_checkpoint,
     );
-    pb.finish_with_message(if result.interrupted { "interrupted" } else { "done" });
+    pb.finish();
 
     if result.interrupted {
         match &effective_checkpoint_path {
@@ -496,7 +521,7 @@ fn run_missing(
         std::process::exit(130);
     }
 
-    print_result(result.mnemonic, resume_index + result.combinations_tested, result.elapsed_ms)
+    print_result(result.mnemonic, resume_index + result.combinations_tested, result.elapsed_ms, address, total, checksum_collisions(n, total))
 }
 
 fn run_typo(
@@ -518,12 +543,13 @@ fn run_typo(
     let validation = build_validation(Some(address), passphrase, account_start, account_end, address_start, address_end)?
         .ok_or_else(|| anyhow!("Typo recovery requires --address"))?;
 
-    println!(
-        "{} Searching for one typo in a {}-word seed against {}",
-        style("⚙").cyan(), n, style(&validation.address).yellow(),
-    );
-
     let total = (n as u64) * 2048;
+
+    let mut rows = vec![("looking for", "one wrong word, position unknown".to_string())];
+    if !passphrase.is_empty() {
+        rows.push(("passphrase", "provided".to_string()));
+    }
+    ui::print_run_header("find a typo", n, &rows, total, Some(&validation.address), checkpoint_path.as_deref());
 
     let expected_sig = Checkpoint {
         mode: "typo".into(),
@@ -563,7 +589,7 @@ fn run_typo(
     let result = seedcrypt_recover::recovery::recover_typo_resumable(
         &req, resume_index, &stop, progress, write_checkpoint,
     );
-    pb.finish_with_message(if result.interrupted { "interrupted" } else { "done" });
+    pb.finish();
 
     if result.interrupted {
         match &effective_checkpoint_path {
@@ -596,7 +622,7 @@ fn run_typo(
         std::process::exit(130);
     }
 
-    print_result(result.mnemonic, resume_index + result.combinations_tested, result.elapsed_ms)
+    print_result(result.mnemonic, resume_index + result.combinations_tested, result.elapsed_ms, Some(address), total, 0)
 }
 
 fn run_reorder(
@@ -640,10 +666,15 @@ fn run_reorder(
         .ok_or_else(|| anyhow!("reorder recovery requires --address"))?;
 
     let total = seedcrypt_recover::lehmer::factorial(k as u64);
-    println!(
-        "{} Searching {total} permutation(s) of {k} marked position(s) in a {n}-word seed against {}",
-        style("⚙").cyan(), style(&validation.address).yellow(),
-    );
+
+    let mut rows = vec![(
+        "reordering",
+        format!("{k} marked position(s), all others fixed"),
+    )];
+    if !passphrase.is_empty() {
+        rows.push(("passphrase", "provided".to_string()));
+    }
+    ui::print_run_header("recover word order", n, &rows, total, Some(&validation.address), checkpoint_path.as_deref());
 
     let permute_positions_str = permute_positions_1indexed.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
     let expected_sig = Checkpoint {
@@ -683,7 +714,7 @@ fn run_reorder(
     let result = seedcrypt_recover::recovery::recover_reorder_resumable(
         &words, permute_positions, Some(validation), resume_index, &stop, progress, write_checkpoint,
     );
-    pb.finish_with_message(if result.interrupted { "interrupted" } else { "done" });
+    pb.finish();
 
     if result.interrupted {
         match &effective_checkpoint_path {
@@ -717,36 +748,49 @@ fn run_reorder(
         std::process::exit(130);
     }
 
-    print_result(result.mnemonic, resume_index + result.combinations_tested, result.elapsed_ms)
+    print_result(result.mnemonic, resume_index + result.combinations_tested, result.elapsed_ms, Some(address), total, 0)
 }
 
-fn print_result(mnemonic: Option<Vec<String>>, tested: u64, elapsed_ms: u128) -> Result<()> {
+/// How many *other* phrases in this search space also satisfy the BIP39
+/// checksum.
+///
+/// The checksum is `word_count / 3` bits — 4 for a 12-word seed, 8 for 24 — so
+/// roughly one candidate in `2^bits` passes it. Only ever shown to quantify how
+/// weak a checksum-only hit is: "262,143 other phrases also pass this test" is
+/// what stops someone acting on it; "many" is not.
+fn checksum_collisions(word_count: usize, total: u64) -> u64 {
+    let checksum_bits = (word_count / 3) as u32;
+    (total >> checksum_bits.min(63)).saturating_sub(1)
+}
+
+/// `address` is `None` when the run had no `--address`, which is what
+/// separates a verified recovery from a mere checksum hit. `total` and
+/// `collisions` let the unverified case say how many other phrases would have
+/// passed the same test.
+fn print_result(
+    mnemonic: Option<Vec<String>>,
+    tested: u64,
+    elapsed_ms: u128,
+    address: Option<&str>,
+    total: u64,
+    collisions: u64,
+) -> Result<()> {
+    println!();
     match mnemonic {
         Some(words) => {
-            println!();
-            println!("{}", style("═══ SEED FOUND ═══").green().bold());
-            println!();
-            println!(
-                "  {} {}",
-                style("Mnemonic:").bold(),
-                style(words.join(" ")).yellow()
-            );
-            println!(
-                "  {} {} candidates in {:.2}s",
-                style("Tested:").dim(),
-                tested,
-                elapsed_ms as f64 / 1000.0
-            );
+            let outcome = match address {
+                Some(addr) => ui::Outcome::Verified { address: addr },
+                None => ui::Outcome::Unverified { collisions },
+            };
+            ui::print_outcome(&outcome, tested, total, elapsed_ms);
+            ui::print_seed(&words);
+            ui::print_next_steps();
+            ui::print_footer();
             Ok(())
         }
         None => {
-            println!();
-            println!("{}", style("No match found.").red());
-            println!(
-                "  Tested {} candidates in {:.2}s",
-                tested,
-                elapsed_ms as f64 / 1000.0
-            );
+            ui::print_outcome(&ui::Outcome::NoMatch, tested, total, elapsed_ms);
+            ui::print_recovery_hints();
             std::process::exit(1);
         }
     }
