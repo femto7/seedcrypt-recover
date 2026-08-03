@@ -1,9 +1,58 @@
 # seedcrypt-recover
 
-> Fast offline BIP39 seed recovery tool — a Rust port of the relevant parts of [btcrecover](https://github.com/3rdIteration/btcrecover).
+> Recover a BIP39 seed phrase with missing, mistyped or reordered words — offline, in Rust.
 
 100% offline. No network calls anywhere in this tool or its dependencies.
 Your seed never leaves your machine.
+
+Part of [SeedCrypt](https://seedcrypt.app). If you would rather follow a guide than
+a command line, start at [seedcrypt.app/recover](https://seedcrypt.app/recover).
+
+## Download
+
+Prebuilt binaries — no Rust toolchain needed. Grab the
+[**latest release**](https://github.com/femto7/seedcrypt-recover/releases/latest):
+
+| Platform | Archive |
+|----------|---------|
+| Windows (x86-64) | `seedcrypt-recover-<version>-x86_64-pc-windows-msvc.zip` |
+| macOS (Apple Silicon) | `seedcrypt-recover-<version>-aarch64-apple-darwin.tar.gz` |
+| macOS (Intel) | `seedcrypt-recover-<version>-x86_64-apple-darwin.tar.gz` |
+| Linux (x86-64) | `seedcrypt-recover-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+
+Every archive ships with a matching `.sha256`. Verify it before you run anything
+that will touch your seed:
+
+```bash
+sha256sum -c seedcrypt-recover-<version>-x86_64-unknown-linux-gnu.tar.gz.sha256
+```
+
+Prefer to build it yourself? See [Installation](#installation) — the source is
+the same thing the release binaries are built from, by GitHub Actions.
+
+## Will this work for your seed?
+
+Read this before you spend a night on it. What you actually know decides
+everything, and some cases are genuinely hopeless:
+
+| What you know | Realistic? |
+|---------------|-----------|
+| All words, but one is wrong | **Yes** — seconds |
+| 1 word missing, position known | **Yes** — instant |
+| 2 words missing, positions known | **Yes** — minutes |
+| 2 words swapped, positions suspected | **Yes** — instant |
+| 3 words missing | Hours to days |
+| 4+ words missing, or positions unknown | **No.** The search space explodes far past what a desktop can chew through. |
+| No address from the wallet | **No.** There is nothing to validate candidates against. |
+
+If your case falls in a **No** row, no tool will save you — including the paid
+"recovery services" that take a percentage of your funds. Better to know now
+than after a week of hoping.
+
+One thing worth checking first: a single wrong word breaks the BIP39 checksum in
+roughly 94% of cases on a 12-word phrase. If your wallet says *"invalid mnemonic"*
+rather than showing an empty balance, you very likely have a typo — the easiest
+case on this list.
 
 ## What it does
 
@@ -16,14 +65,20 @@ Two modes:
 
 Both modes use [`libsecp256k1`](https://github.com/bitcoin-core/secp256k1) (FFI'd via the [`secp256k1`](https://crates.io/crates/secp256k1) crate) for the elliptic-curve math, with [`rayon`](https://crates.io/crates/rayon) for parallel iteration across CPU cores. First match wins, others stop.
 
-## Why
+## Why another recovery tool
 
-[btcrecover](https://github.com/3rdIteration/btcrecover) is the reference tool but ships as Python with a heavy dependency tree, no pre-built binary, and a setup-heavy install. This is:
+[btcrecover](https://github.com/3rdIteration/btcrecover) is the canonical
+implementation and the algorithmic reference for this project. It ships as Python
+with a heavy dependency tree and no prebuilt binary — a poor fit for someone who
+has just lost access to their funds and does not want to set up a Python
+environment first.
 
-- A single binary (~3 MB, statically linked).
-- Memory-safe (Rust's borrow checker eliminates whole classes of crypto-relevant CVEs).
-- Same speed as btcrecover in practice (the hot path is `libsecp256k1` either way).
-- Reusable as a library (`cdylib`) — the same crate can be FFI'd from Flutter / Python / Node.js / Go.
+seedcrypt-recover is:
+
+- **A single binary** (~3 MB, statically linked) — download, run, done.
+- **Memory-safe** — Rust's borrow checker eliminates whole classes of crypto-relevant CVEs.
+- **The same speed in practice** — the hot path is `libsecp256k1` either way.
+- **Reusable as a library** (`cdylib`) — the same crate can be FFI'd from Flutter / Python / Node.js / Go.
 
 ## Status
 
@@ -59,6 +114,8 @@ EVM chains share the same address as Ethereum from the same seed — just give a
 Out of scope: Solana, Cardano, Polkadot, Cosmos, Stellar (different curves — ed25519 / sr25519, not secp256k1).
 
 ## Installation
+
+Most people should use a [prebuilt binary](#download). To build from source:
 
 ```bash
 cargo install --git https://github.com/femto7/seedcrypt-recover
